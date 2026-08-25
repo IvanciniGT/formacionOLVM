@@ -41,7 +41,7 @@ Hablamos de 2 tipos de hipervisores:
           Básicamente tenemos Hipervisor + SO como u unidad
           ESXi, KVM 
 - Tipo 2: Se instala sobre un sistema operativo existente, lo que significa que depende del sistema operativo anfitrión para funcionar.
-          hyperV, VirtualBox, VMware Workstation 
+          VirtualBox, VMware Workstation 
 
 # KVM
 
@@ -172,7 +172,6 @@ Wildfly es un servidor de aplicaciones de clase EMPRESARIAL... no es un tomcat, 
 - Eventos y observabilidad
     -> Integrado con Prometheus y Grafana
 - Backups y recuperación ante desastres
-    -> Integrado con Velero 
 - Gestión de redes y almacenamiento
 
 # Notas adicionales sobre Virtualización y Oracle.
@@ -249,7 +248,7 @@ Más adelante, que hablemos de la instalación, veremos que hay 2 formas de inst
 
 Ya hemos dicho que en postgreSQL. Con 2 finalidades:
 
-`ovirt-engine`              -> Inventario, configuración, estado de las VMs, hosts, redes, almacenamiento, etc.
+`engine`              -> Inventario, configuración, estado de las VMs, hosts, redes, almacenamiento, etc.
     Esto es obligatorio
 `ovirt-engine-history`      -> Historial de cambios, eventos y métricas de las VMs, hosts, redes, almacenamiento, etc.  
     Si no instalo esto, pierdo ciertas utilidades en la UI del engine, como por ejemplo la monitorización de métricas de las VMs, hosts, redes, almacenamiento, etc.
