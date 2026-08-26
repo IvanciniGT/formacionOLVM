@@ -1,0 +1,230 @@
+# YAML Es un lenguaje de marcado de información
+# Sería una alternativa a XML o a JSON, o incluso a ficheros .properties .ini
+# No es una alternativa... es LA ATERNATIVA.
+# Todo hoy en día se hace con archivos YAML:
+# - Terraform: Toda la parametrización de infraestructura como código se hace con YAML.
+# - Kubernetes: Todos los despliegues de contenedores se hacen con YAML.
+# - Ansible: La configuración de sistemas y despliegues automatizados se hace con YAML.
+# - Ubuntu: La definición de la red de Ubuntu se hace con YAML.
+# Todo el mundo está usando YAML.. y cada día más.
+# Es muy sencillo. Está pensado para seres humanos.
+
+# Podemos poner comentarios: ALELUYA ! Eso de que en json no se puedan poner comentarios es un horror. En YAML sí se pueden poner comentarios, y además, son muy útiles.
+# Lo que pongo detrás del # es un comentario. No se ejecuta, no se interpreta, no se procesa. Es solo para que los humanos podamos entender mejor el código.
+
+# Dentro de un archivo YAML puedo tener muchos documentos yaml.
+# No se soporta en ningún otro lenguaje.
+--- 
+# Los --- son la marca de inicio de documento
+# Permiten escribir en un fichero varios documentos distintos, que se procesarían de forma independiente.
+# Es obligatoria, salvo en el primero documento del archivo que no se pone.
+---
+# A la vista del nombre.. a quién nos recuerda? YAML
+#                                                XML
+#                                               HTML
+# ML? Markup language.. lenguaje de marcado... y por ende, qué esperamos encontrar dentro?   <tag> </tag>  <tag> </tag>  <tag> </tag>  <tag> </tag>
+# Pero no... YAML = YAML ain't markup language. No busques aquñi marquitas que no las vas a encontrar
+---
+# Un documento YAML es UN NODO.
+# Hay 2 tipos de nodos: Escalares y Colecciones.
+---
+# Escalares: Son los valores simples, como un número, un string, un booleano, etc.
+# Números: 
+4
+---
+-3.15
+---
+# Booleanos:
+true # True TRUE
+---
+false # False FALSE
+---
+# Textos: LO MAS COMPLEJO CON DIFERENCIA DE YAML
+Puedo "escribir 'un \ntexto 
+tal 
+
+cual... #sin comillas
+---
+"Puedo \"escribir 'un \ntexto 
+
+con 
+comillas #dobles"
+# Contrabarra solo funciona entre comillas dobles como caracter de escape:
+# \\
+# \"
+# \n
+# \r
+---
+'Puedo "escribir ''un \ntexto 
+
+con 
+comillas #simples'
+# A mi elección.
+# Los textos tienen sus cositas.
+# RESUMEN: SENCILLO:
+# Tiendo a poner textos de una linea sin comillas.
+# Si me veo en la necesidad de poner comillas, las pondre: Por poner un # por ejemplo
+
+---
+# Y si el texto tiene más de una linea o quiero escribirlo en m´ñas de una linea: 
+# HAY OTRAS 2 sintaxis adicionales
+# Sintaxis literal:
+|1-
+  Empiezo a escribir mi texto
+ Y el lector (parser) de yaml 
+  No le toca ni una coma
+
+ Da igual que ponga caracteres raros
+ @"#'\\" 
+ Lo deja tal cual
+
+
+---
+# Sintaxis folded: Se come todos los saltos de linea (los cambia por espacios)
+>
+ Empiezo a escribir mi texto
+ Y el lector (parser) de yaml 
+  No le toca ni una coma
+
+ Da igual que ponga caracteres raros
+ @"#'\\" 
+ Lo deja tal cual
+---
+
+# Colección: Mapas desordenados y listas ordenadas
+
+# Listas ordenadas: Colección de nodos en la que el orden importa
+- item1
+-  true
+- 33
+-
+    - subitem1
+    - subitem2
+-
+                -    subitem1
+                - subitem2
+    # Sangrado que he de aplicar aqui: EL QUE QUIERA , PERO SIN VACILAR
+    # Y cuidado.. si uso NANO, VI... un tab se puede representar como 4 espacios... pero SON COSAS DIFERENTES.
+    # Y esto da mucho dolor de cabeza si no uso un editor bueno, como VSCODE, que cambia los tabs por espacios
+    # Si en un item tengo un tab y en otro 4 espacios en blanco.. aunque LOS VEA IGUAL, YAML piensa que le estoy VACILANDO -> ERROR DE SINTAXIS
+---
+# Hay una sintaxis alternativa a las listas:
+- item1
+- 2
+- true
+---
+[item1, 2, true] # Esto cuela. # DESACONSEJADO TOTALMENTE. 2 motivos:
+    # - Es más complejo de leer
+    # - Estos archivos van a terminar (DEBERIAN TERMINAR) en un sistema de control de versiones, tipo GIT
+    #   Git identifica cambios a nivel de linea. Si en una linea pongo 3 items, y cambio uno, GIT NO ES CAPAZ DE DECIRME QUE HE CAMBIADO.. solo la linea donde esta el cambio.
+    #   Si pongo cada item en una linea, GIT me dirá exactamente qué item he cambiado.
+# Esta sintaxis existe para COMPATIBILIDAD CON JSON: TODO DOCUMENTO JSON SE PUEDE TRATAR COMO SI FUERA YAML:
+# YAML SE HA COMIDO AL ESTANDAR JSON... O de otyra forma: JSON ES UN SUBCONJUNTO DE YAML. TODO JSON ES YAML, PERO NO TODO YAML ES JSON.
+# Solo hay un caso de uso legítimo de esta sintaxis: LISTA VACIA:
+---
+[] # Esto es una lista vacía. No hay otra forma de escribirlo.
+---
+# Mapas desarodenados: Son listas de items(nodos) que van identificadas por una clave. Lista de pares clave-valor. El orden no importa.
+clave1:       valor1
+clave2: true
+clave3: 33
+clave4: 
+    - subitem1
+    - subitem2
+clave5:
+    subclave1: subvalor1
+    subclave2:          subvalor2
+
+clave6:
+                subclave1: subvalor1
+                subclave2: subvalor2
+    # Mismas reglas de sangrado que en las listas. Puedo usar el que quiera, pero sin vacilar.
+
+---
+
+# Hay una sintaxis alternativa a los mapas desordenados:
+{clave1: valor1, clave2: true, clave3: 33}
+# Esta sintaxis existe para COMPATIBILIDAD CON JSON: TODO DOCUMENTO JSON SE PUEDE TRATAR COMO SI FUERA YAML:
+# No la usamos los humanos... mismos motivos que en las listas: Complejo de leer y GIT no es capaz de identificar cambios a nivel de item.
+# Solo hay un caso de uso legítimo de esta sintaxis: MAPA VACIO:
+---
+{} # Esto es un mapa vacío. No hay otra forma de escribirlo.
+---
+# Nota adicional:
+# LOS MAPAS SON DESORDENADOS!!! EL ORDEN NO IMPORTA
+clave1: valor1
+clave2: true
+clave3: 33
+---
+clave1: valor1
+clave3: 33
+clave2: true
+# Desde el punto de vista de YAML, son exactamente iguales. El orden no importa.
+
+# Y esto es todo amigos!!!!!
+---
+# NOTA 2
+# YAML define una sintaxis... mas simple que XML o JSON
+# JSON:
+#    { 
+#           "usuario": "pepe",
+#           "password": "1234",
+#           "ssh": {
+#                       "host": "192.168.1.2",
+#                       "port": 22
+#                   }
+#    }
+
+# XML: 
+#    <usuario>
+#       <nombre>pepe</nombre>
+#       <password>1234</password>
+#       <ssh>
+#           <host>192.168.1.2</host>
+#           <port>22</port>
+#       </ssh>
+#    </usuario>
+
+# YAML:
+usuario:
+    nombre:             pepe
+    password:           1234
+    ssh:
+        host:           192.168.1.2
+        port:           22
+
+# Pero decía:
+# YAML SOLO DA LA SINTAXIS.
+# Cada programa que usa YAML define su ESQUEMA
+# Es decir, la estructura que tiene que tener ese archivo YAML
+
+# Si yo le paso el documento del usuario a NETPLAN en UBUNTU: FLIPA! 
+# Si yo le paso el documento del usuario a CLOUD-INI: FLIPA!
+
+---
+
+# Un documento netplan tiene esta pinta:
+network:
+    version: 2
+    renderer: networkd
+    ethernets:
+        eth0:
+            dhcp4: true
+            nameservers:
+                addresses: 
+                    - 8.8.8.8
+                    - 8.8.4.4
+---
+# Un documento cloud-init tiene esta pinta:
+#cloud-config
+users:
+    - name: pepe
+      groups: sudo
+      shell: /bin/bash
+
+package_update: true
+packages:
+    - htop
+    - git
+
+# Si paso otras marcas: ERROR DE SINTAXIS. No es que no entienda el YAML.. es que no entiende el esquema de cloud-init.

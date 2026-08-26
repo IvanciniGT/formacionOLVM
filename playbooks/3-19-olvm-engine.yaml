@@ -1,0 +1,2657 @@
+# Instalación y configuración de OLVM sobre el laboratorio que provisiona
+# 3-18-olvm.yaml. Aquí ya no se toca el clúster de Kubernetes para nada:
+# todo ocurre dentro de las tres VMs y contra la API del engine.
+#
+# Tags:  engine | setup | datacenter | hosts | storage | usuarios | verificar
+#
+#   ansible-navigator run playbooks/3-extras/3-19-olvm-engine.yaml -e @parametros/desa.yaml
+#
+# Requisitos en el controlador: colección ovirt.ovirt y ovirt-engine-sdk-python.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 0 — INVENTARIO EN CALIENTE DE LAS VMs
+# ═══════════════════════════════════════════════════════════════════════════
+- name: "OLVM — meter las VMs del laboratorio en el inventario"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [always]
+
+  tasks:
+    # add_host lleva BYPASS_HOST_LOOP=True: se ejecuta una sola vez, así que
+    # tiene que recorrer él mismo la lista de VMs.
+    - name: "Añadir cada VM a su grupo según el rol"
+      ansible.builtin.add_host:
+        name: "{{ item.nombre }}"
+        groups: "{{ ['olvm_vms', 'olvm_' + item.rol] }}"
+        ansible_host: "{{ item.ip }}"
+        ansible_user: ivan
+        # Explícito: los plays contra la API llevan connection: local, y sin
+        # esto una tarea delegada a una VM ejecutaría el sudo en el
+        # controlador en vez de en la VM.
+        ansible_connection: ssh
+        ansible_python_interpreter: "{{ olvm.imagenes[item.so].python }}"
+        olvm_rol: "{{ item.rol }}"
+        olvm_fqdn: "{{ item.fqdn }}"
+      loop: "{{ olvm.vms }}"
+      loop_control:
+        label: "{{ item.nombre }} -> olvm_{{ item.rol }}"
+      changed_when: false
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 1 — INSTALAR ovirt-engine EN LA VM DEL ENGINE
+# ═══════════════════════════════════════════════════════════════════════════
+- name: "OLVM — instalar el paquete ovirt-engine"
+  hosts: olvm_engine
+  gather_facts: false
+  become: true
+  tags: [engine]
+
+  tasks:
+    # La imagen cloud de Oracle trae growpart configurado para un layout sin
+    # LVM: de los 60 GB del disco sólo aprovecha 35,8 y deja / en 32 GB, que
+    # es justo el mínimo que pide Oracle para el engine. Las cuatro
+    # operaciones son online e idempotentes.
+    - name: "Crecer la partición de datos al tamaño real del disco"
+      ansible.builtin.command: "growpart /dev/vda 4"
+      register: gp
+      changed_when: "'CHANGED' in gp.stdout"
+      failed_when:
+        - gp.rc != 0
+        - "'NOCHANGE' not in gp.stdout"
+
+    - name: "Redimensionar el physical volume"
+      ansible.builtin.command: "pvresize /dev/vda4"
+      register: pvr
+      changed_when: "'successfully resized' in pvr.stdout"
+
+    - name: "Extender el logical volume de root a todo el espacio libre"
+      ansible.builtin.command: "lvextend -l +100%FREE /dev/vg_main/lv_root"
+      register: lve
+      changed_when: "'successfully resized' in lve.stdout"
+      failed_when:
+        - lve.rc != 0
+        - "'matches existing size' not in lve.stderr"
+        - "'insufficient free space' not in lve.stderr"
+
+    - name: "Crecer el sistema de ficheros XFS de /"
+      ansible.builtin.command: "xfs_growfs /"
+      register: xfsg
+      changed_when: "'blocks changed' in xfsg.stdout or 'data blocks changed' in xfsg.stdout"
+
+    - name: "Verificación — espacio en / tras la ampliación"
+      ansible.builtin.shell: "set -o pipefail; df -BG --output=size,avail / | tail -1"
+      args:
+        executable: /bin/bash
+      register: df_root
+      changed_when: false
+
+    - name: "Espacio disponible en el engine"
+      ansible.builtin.debug:
+        msg: "/ = {{ df_root.stdout | trim }} (tamaño, disponible)"
+
+    - name: "Repositorio de OLVM 4.5"
+      ansible.builtin.command: "dnf install -y oracle-ovirt-release-45-el8"
+      args:
+        creates: /etc/yum.repos.d/oracle-ovirt-45-ol8.repo
+      register: repo_olvm
+
+    - name: "Verificación — los repos de oVirt están habilitados"
+      ansible.builtin.shell: "set -o pipefail; dnf repolist | grep -c '^ovirt-4.5'"
+      args:
+        executable: /bin/bash
+      register: repos_ovirt
+      changed_when: false
+      failed_when: repos_ovirt.stdout | int < 1
+
+    # Por comando y no con el módulo dnf: en OL8 los bindings de dnf sólo
+    # existen para platform-python 3.6, que ansible-core 2.20 ya no admite.
+    # Descarga ~1 GB y en una VM anidada tarda un buen rato.
+    - name: "Instalar ovirt-engine (descarga grande, paciencia)"
+      ansible.builtin.command: "dnf install -y ovirt-engine"
+      args:
+        creates: /usr/bin/engine-setup
+      async: 7200
+      poll: 30
+
+    # El dashboard del portal ("Panel") lee de la base del Data Warehouse.
+    # Con --offline engine-setup no instala paquetes, así que hay que ponerlos
+    # antes de que los configure.
+    - name: "Instalar el Data Warehouse (lo necesita la pantalla Panel)"
+      ansible.builtin.command: "dnf install -y ovirt-engine-dwh ovirt-engine-dwh-setup"
+      args:
+        creates: /usr/share/ovirt-engine-dwh/services/ovirt-engine-dwhd/ovirt-engine-dwhd.py
+      when: olvm.dwh | bool
+
+    - name: "Verificación — engine-setup disponible y versión del engine"
+      ansible.builtin.shell: "set -o pipefail; rpm -q --qf '%{VERSION}-%{RELEASE}' ovirt-engine"
+      args:
+        executable: /bin/bash
+      register: ver_engine
+      changed_when: false
+
+    - name: "Versión instalada"
+      ansible.builtin.debug:
+        msg: "ovirt-engine {{ ver_engine.stdout }} en {{ inventory_hostname }}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 2 — PREPARAR LOS HOSTS KVM
+# ═══════════════════════════════════════════════════════════════════════════
+# El engine despliega vdsm sobre estos hosts, pero los paquetes salen de los
+# repos del propio host: sin el release de OLVM 4.5 para OL9, el alta falla.
+- name: "OLVM — preparar los hosts KVM para el alta"
+  hosts: olvm_host
+  gather_facts: false
+  become: true
+  tags: [prep-hosts]
+
+  tasks:
+    - name: "Repositorio de OLVM 4.5 para Oracle Linux 9"
+      ansible.builtin.command: "dnf install -y oracle-ovirt-release-45-el9"
+      args:
+        creates: /etc/yum.repos.d/oracle-ovirt-45-ol9.repo
+
+    - name: "Verificación — repos de oVirt habilitados en el host"
+      ansible.builtin.shell: "set -o pipefail; dnf repolist | grep -c '^ovirt-4.5'"
+      args:
+        executable: /bin/bash
+      register: repos_host
+      changed_when: false
+      failed_when: repos_host.stdout | int < 1
+
+    # vdsm necesita dos módulos del kernel que la imagen cloud de Oracle NO
+    # trae cargables: softdog (lo exige wdmd, y sin wdmd no arranca sanlock ni
+    # vdsmd) y openvswitch (lo exige ovs-vswitchd). Los dos viven en
+    # kernel-uek-modules, que además arrastra un kernel-uek-core más nuevo:
+    # por eso hay que reiniciar ANTES de dar el host de alta. Si no, el
+    # despliegue de vdsm instala ese kernel a mitad y falla al arrancar los
+    # servicios contra el kernel viejo, que aún corre.
+    - name: "Instalar kernel-uek-modules (trae softdog y openvswitch)"
+      ansible.builtin.command: "dnf install -y kernel-uek-modules"
+      register: mods_kernel
+      changed_when: "'Nothing to do' not in mods_kernel.stdout"
+
+    - name: "Kernel en ejecución"
+      ansible.builtin.command: "uname -r"
+      register: kernel_actual
+      changed_when: false
+
+    - name: "Kernel marcado como predeterminado"
+      ansible.builtin.command: "grubby --default-kernel"
+      register: kernel_default
+      changed_when: false
+
+    - name: "Reiniciar el host para arrancar con el kernel que tiene los módulos"
+      ansible.builtin.reboot:
+        reboot_timeout: 900
+        msg: "Reinicio para activar kernel-uek-modules (softdog / openvswitch)"
+      when: kernel_actual.stdout not in kernel_default.stdout
+
+    - name: "Verificación — softdog y openvswitch se cargan"
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop: [softdog, openvswitch]
+
+    - name: "Verificación — vdsm es instalable desde los repos del host"
+      ansible.builtin.command: "dnf -q info vdsm"
+      register: vdsm_info
+      changed_when: false
+
+    - name: "Resumen del host"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} ({{ ansible_host }}): repos ovirt OK,
+          vdsm {{ vdsm_info.stdout | regex_search('Version *: *([0-9.]+)', '\1') | first | default('?') }} disponible
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 3 — engine-setup DESATENDIDO
+# ═══════════════════════════════════════════════════════════════════════════
+# engine-setup es interactivo por naturaleza. Con --accept-defaults contesta
+# solo a todo lo que tiene valor por defecto, y el fichero de respuestas
+# aporta lo que no lo tiene (la password de admin) y lo que queremos cambiar.
+- name: "OLVM — engine-setup desatendido"
+  hosts: olvm_engine
+  gather_facts: false
+  become: true
+  tags: [setup]
+
+  tasks:
+    - name: "¿Está el engine ya configurado?"
+      ansible.builtin.stat:
+        path: /etc/ovirt-engine/engine.conf.d/10-setup-database.conf
+      register: engine_ya
+
+    # engine-setup se vuelve a lanzar también si falta el DWH: es la forma
+    # soportada de añadirlo a un engine ya instalado.
+    - name: "¿Existe la base de datos del Data Warehouse?"
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        sudo -u postgres psql -tAc
+        "select 1 from pg_database where datname='ovirt_engine_history'"
+      args:
+        executable: /bin/bash
+      register: dwh_db
+      changed_when: false
+      failed_when: false
+
+    - name: "Fichero de respuestas para engine-setup"
+      ansible.builtin.copy:
+        dest: /root/olvm-answers.conf
+        mode: "0600"
+        content: |
+          [environment:default]
+          OVESETUP_DIALOG/confirmSettings=bool:True
+          OVESETUP_CONFIG/fqdn=str:{{ olvm.vms[0].fqdn }}
+          OVESETUP_CONFIG/adminPassword=str:{{ olvm.admin_password }}
+          # virt y no both: no hay Gluster en este laboratorio.
+          OVESETUP_CONFIG/applicationMode=str:virt
+          # Keycloak DESACTIVADO a propósito. Con él, el login deja de ser
+          # admin@internal y los usuarios internos de aaa-jdbc no sirven;
+          # además son ~500 MB de RAM en una VM de 8 GB. Para el curso
+          # interesa el aaa-jdbc clásico.
+          OVESETUP_CONFIG/keycloakEnable=bool:False
+          # DWH según olvm.dwh: la pantalla "Panel" del portal no funciona sin
+          # él. Grafana (informes) siempre fuera: pesa y el curso no lo usa.
+          OVESETUP_DWH_CORE/enable=bool:{{ olvm.dwh | bool | string | capitalize }}
+          OVESETUP_GRAFANA_CORE/enable=bool:False
+          # ovirt-provider-ovn DESACTIVADO. No es opcional: el kernel UEK de
+          # Oracle Linux 8 NO trae el módulo openvswitch
+          # (modprobe openvswitch -> "Module not found"), así que ovs-vswitchd
+          # no arranca y engine-setup aborta en "Failed to start service
+          # 'openvswitch'". Además el laboratorio no usa redes definidas por
+          # software: las VMs cuelgan del bridge ovirtmgmt sobre la LAN.
+          QUESTION/1/ovirt-provider-ovn=str:no
+          # Si un intento anterior abortó, deja la PKI a medias (sin ca.pem) y
+          # setup pregunta si sobrescribirla, con "No" por defecto: eso hace
+          # que --accept-defaults aborte y el reintento nunca avance. Decimos
+          # que sí. Sólo se pregunta en ese estado inconsistente, y el aviso
+          # que lleva ("habrá que re-enrolar los certificados de los hosts")
+          # no aplica mientras no haya ningún host dado de alta.
+          QUESTION/1/OVESETUP_PKI_VERIFY_MISSING_CA_PEM=str:yes
+      no_log: true
+      when: not engine_ya.stat.exists or (olvm.dwh | bool and dwh_db.stdout | trim != '1')
+
+    # En una VM anidada esto tarda entre 15 y 40 minutos.
+    - name: "Ejecutar engine-setup (tarda: despliega WildFly y crea la BD)"
+      ansible.builtin.command: >-
+        engine-setup
+        --accept-defaults
+        --config-append=/root/olvm-answers.conf
+        --offline
+      register: setup_out
+      when: not engine_ya.stat.exists or (olvm.dwh | bool and dwh_db.stdout | trim != '1')
+      async: 7200
+      poll: 30
+      changed_when: true
+
+    # Con OVN desactivado, openvswitch no pinta nada en el engine, y además
+    # nunca podría arrancar: el kernel UEK de OL8 no trae el módulo. Si un
+    # intento previo lo dejó habilitado, aparece como unidad fallida para
+    # siempre. Lo apagamos para que "systemctl --failed" quede limpio.
+    - name: "Desactivar openvswitch en el engine (OVN deshabilitado)"
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: false
+        state: stopped
+      loop: [ovs-vswitchd, openvswitch]
+      failed_when: false
+      # ovs-vswitchd nunca puede arrancar aquí (falta el módulo del kernel),
+      # así que systemd lo reporta como cambiado en cada pasada. No lo es.
+      changed_when: false
+
+    - name: "Limpiar el estado failed de esas unidades"
+      ansible.builtin.command: "systemctl reset-failed {{ item }}"
+      loop: [ovs-vswitchd, openvswitch]
+      changed_when: false
+      failed_when: false
+
+    - name: "Verificación — el servicio ovirt-engine está activo"
+      ansible.builtin.systemd_service:
+        name: ovirt-engine
+        state: started
+        enabled: true
+      register: svc_engine
+
+    - name: "Verificación — la API REST responde"
+      ansible.builtin.uri:
+        url: "https://{{ olvm.vms[0].fqdn }}/ovirt-engine/api"
+        method: GET
+        user: "admin@internal"
+        password: "{{ olvm.admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        headers:
+          Accept: application/json
+        status_code: 200
+      register: api_engine
+      until: api_engine.status == 200
+      retries: 30
+      delay: 10
+      no_log: true
+
+    - name: "Versión que reporta la API"
+      ansible.builtin.debug:
+        msg: >-
+          engine {{ api_engine.json.product_info.version.full_version }} ·
+          API viva en https://{{ olvm.vms[0].fqdn }}/ovirt-engine/
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 3.4 — COPIA DE SEGURIDAD DEL ENGINE
+# ═══════════════════════════════════════════════════════════════════════════
+# engine-backup vuelca configuración + base de datos. Se escribe en el export
+# /backups de maestro y NO en el disco de la VM: si se pierde el engine hay
+# que poder restaurarlo desde otra máquina.
+- name: "OLVM — directorio de copias en el servidor NFS"
+  hosts: maestro
+  gather_facts: false
+  become: true
+  tags: [backup]
+
+  tasks:
+    - name: "Crear {{ olvm.backup.ruta_nfs }}"
+      ansible.builtin.file:
+        path: "{{ olvm.backup.ruta_nfs }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+- name: "OLVM — programar la copia de seguridad del engine"
+  hosts: olvm_engine
+  gather_facts: false
+  become: true
+  tags: [backup]
+
+  tasks:
+    - name: "Montar el destino de las copias"
+      ansible.posix.mount:
+        src: "{{ olvm.nfs.servidor }}:{{ olvm.backup.ruta_nfs }}"
+        path: "{{ olvm.backup.ruta_nfs }}"
+        fstype: nfs
+        opts: "defaults,_netdev"
+        state: mounted
+
+    - name: "Script de copia con rotación"
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/olvm-backup.sh
+        mode: "0750"
+        content: |
+          #!/bin/bash
+          # Copia de seguridad de OLVM. La programa 3-19-olvm-engine.yaml.
+          set -euo pipefail
+          D={{ olvm.backup.ruta_nfs }}
+          F=$D/olvm-$(date +%Y%m%d-%H%M).backup
+          engine-backup --scope=all --mode=backup --file="$F" --log="$F.log"
+          # Rotación: fuera lo que pase de {{ olvm.backup.retener_dias }} días.
+          find "$D" -name 'olvm-*.backup*' -mtime +{{ olvm.backup.retener_dias }} -delete
+          echo "$(date -Is) copia OK: $F ($(du -h "$F" | cut -f1))"
+
+    - name: "Tarea diaria a las {{ olvm.backup.hora }}"
+      ansible.builtin.cron:
+        name: "copia de seguridad de OLVM"
+        hour: "{{ olvm.backup.hora.split(':')[0] }}"
+        minute: "{{ olvm.backup.hora.split(':')[1] }}"
+        job: "/usr/local/sbin/olvm-backup.sh >> /var/log/olvm-backup.log 2>&1"
+        user: root
+        state: present
+
+    - name: "Verificación — ¿hay alguna copia ya hecha?"
+      ansible.builtin.find:
+        paths: "{{ olvm.backup.ruta_nfs }}"
+        patterns: "olvm-*.backup"
+      register: copias
+
+    - name: "Lanzar una copia inicial si no hay ninguna"
+      ansible.builtin.command: /usr/local/sbin/olvm-backup.sh
+      register: copia_inicial
+      when: copias.matched == 0
+      changed_when: true
+
+    - name: "Resultado de la copia"
+      ansible.builtin.debug:
+        msg: "{{ copia_inicial.stdout | default('ya existían ' ~ copias.matched ~ ' copias') }}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 3.43 — MÉTRICAS HACIA EL PROMETHEUS DEL CLÚSTER
+# ═══════════════════════════════════════════════════════════════════════════
+- name: "OLVM — exponer métricas de collectd en las VMs del laboratorio"
+  hosts: olvm_engine:olvm_host
+  gather_facts: false
+  become: true
+  tags: [metricas]
+
+  tasks:
+    - name: "Instalar el plugin de salida Prometheus de collectd"
+      ansible.builtin.command: "dnf install -y collectd-write_prometheus"
+      args:
+        creates: /usr/lib64/collectd/write_prometheus.so
+      when: olvm.metricas.habilitar | bool
+
+    # Sólo en los hosts KVM: da métricas POR VM (cpu, memoria, disco, red de
+    # cada invitado), que es lo interesante para un panel de virtualización.
+    - name: "Plugin virt en los hosts KVM"
+      ansible.builtin.command: "dnf install -y collectd-virt collectd-disk"
+      args:
+        creates: /usr/lib64/collectd/virt.so
+      when:
+        - olvm.metricas.habilitar | bool
+        - olvm_rol == 'host'
+
+    - name: "Configurar la salida Prometheus"
+      ansible.builtin.copy:
+        dest: /etc/collectd.d/zz-olvm-prometheus.conf
+        mode: "0644"
+        content: |
+          # Expone las métricas de collectd en formato Prometheus.
+          # Lo genera 3-19-olvm-engine.yaml.
+          #
+          # El nombre empieza por "zz" a propósito: collectd lee /etc/collectd.d
+          # en orden alfabético y el engine YA trae un write_prometheus.conf de
+          # ovirt-engine-metrics fijado al 9103. Cargando después, gana este y
+          # los tres nodos quedan en el mismo puerto.
+          LoadPlugin write_prometheus
+          <Plugin write_prometheus>
+            # Host explícito a IPv4: por defecto intenta abrir [::] y falla
+            # con "Opening a listening socket for [::]:PUERTO failed" porque
+            # estas VMs no tienen IPv6 global.
+            Host "0.0.0.0"
+            Port "{{ olvm.metricas.puerto }}"
+          </Plugin>
+      register: conf_prom
+      when: olvm.metricas.habilitar | bool
+
+    - name: "Retirar la configuración antigua si quedó de una versión previa"
+      ansible.builtin.file:
+        path: /etc/collectd.d/10-prometheus.conf
+        state: absent
+      register: limpieza_prom
+      when: olvm.metricas.habilitar | bool
+
+    - name: "Configurar el plugin virt (métricas por VM)"
+      ansible.builtin.copy:
+        dest: /etc/collectd.d/11-virt.conf
+        mode: "0644"
+        content: |
+          # Métricas por máquina virtual. Lo genera 3-19-olvm-engine.yaml.
+         
+         
+      register: conf_virt
+      when:
+        - olvm.metricas.habilitar | bool
+        - olvm_rol == 'host'
+
+    # El plugin virt se conecta a libvirt, que en un host de OLVM exige SASL.
+    # Sin estas credenciales el plugin arranca pero no reporta ninguna VM.
+    - name: "Credenciales de libvirt para collectd"
+      ansible.builtin.shell: |
+        set -o pipefail
+        P=$(cat /etc/pki/vdsm/keys/libvirt_password)
+        cat > /etc/libvirt/auth.conf <<EOF
+        [credentials-vdsm]
+        authname=vdsm@ovirt
+        password=$P
+        [auth-libvirt-localhost]
+        credentials=vdsm
+        EOF
+        chmod 600 /etc/libvirt/auth.conf
+      args:
+        executable: /bin/bash
+        creates: /etc/libvirt/auth.conf
+      when:
+        - olvm.metricas.habilitar | bool
+        - olvm_rol == 'host'
+
+    # SELinux bloquea esto por partida doble y el plugin se descarga solo con
+    # "Initialization of plugin write_prometheus failed":
+    #   1) el puerto tiene que llevar la etiqueta collectd_port_t, y
+    #   2) la política base trata a collectd como CLIENTE: no le permite
+    #      listen/accept en TCP ni name_bind sobre collectd_port_t (sólo UDP).
+    # Lo segundo necesita un módulo de política propio.
+    - name: "¿Está ya el módulo SELinux instalado?"
+      ansible.builtin.shell: "set -o pipefail; semodule -l | grep -c '^collectd_prometheus'"
+      args:
+        executable: /bin/bash
+      register: semodule_check
+      changed_when: false
+      failed_when: false
+      when: olvm.metricas.habilitar | bool
+
+    - name: "Herramientas de política SELinux"
+      ansible.builtin.command: "dnf install -y policycoreutils-python-utils checkpolicy"
+      args:
+        creates: /usr/sbin/semodule_package
+      when: olvm.metricas.habilitar | bool
+
+    - name: "Módulo SELinux que deja a collectd servir métricas"
+      ansible.builtin.copy:
+        dest: /root/collectd_prometheus.te
+        mode: "0644"
+        content: |
+          module collectd_prometheus 1.1;
+
+          require {
+              type collectd_t;
+              type collectd_port_t;
+              class tcp_socket { listen accept name_bind };
+          }
+
+          allow collectd_t self:tcp_socket { listen accept };
+          allow collectd_t collectd_port_t:tcp_socket name_bind;
+      register: te_file
+      when: olvm.metricas.habilitar | bool
+
+    - name: "Compilar e instalar el módulo"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cd /root
+        checkmodule -M -m -o collectd_prometheus.mod collectd_prometheus.te
+        semodule_package -o collectd_prometheus.pp -m collectd_prometheus.mod
+        semodule -i collectd_prometheus.pp
+      args:
+        executable: /bin/bash
+      register: semodule_inst
+      changed_when: true
+      when:
+        - olvm.metricas.habilitar | bool
+        - te_file.changed or (semodule_check.rc | default(1)) != 0
+
+    - name: "Etiquetar el puerto para SELinux"
+      ansible.builtin.command: >-
+        semanage port -a -t collectd_port_t -p tcp {{ olvm.metricas.puerto }}
+      register: semanage_out
+      changed_when: semanage_out.rc == 0
+      failed_when:
+        - semanage_out.rc != 0
+        - "'already defined' not in semanage_out.stderr"
+      when: olvm.metricas.habilitar | bool
+
+    # Por comando: el módulo firewalld necesita los bindings de Python de
+    # firewalld, que sólo existen para el intérprete del sistema y no para el
+    # python3.11 que usamos en el engine.
+    - name: "Abrir el puerto en el cortafuegos"
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - "firewall-cmd --permanent --add-port={{ olvm.metricas.puerto }}/tcp"
+        - "firewall-cmd --reload"
+      register: fw_out
+      changed_when: "'success' in fw_out.stdout"
+      when: olvm.metricas.habilitar | bool
+
+    - name: "Arrancar collectd"
+      ansible.builtin.systemd_service:
+        name: collectd
+        # También reinicia si acaba de instalarse la política o de etiquetarse
+        # el puerto: sin reinicio el plugin sigue descargado.
+        state: "{{ 'restarted' if (conf_prom.changed or limpieza_prom.changed | default(false) or conf_virt.changed | default(false) or semodule_inst.changed | default(false) or semanage_out.changed | default(false)) else 'started' }}"
+        enabled: true
+      when: olvm.metricas.habilitar | bool
+
+    - name: "Verificación — el endpoint de métricas responde"
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ olvm.metricas.puerto }}/metrics"
+        return_content: true
+      register: metricas_out
+      until: metricas_out.status == 200
+      retries: 12
+      delay: 5
+      delegate_to: localhost
+      become: false
+      when: olvm.metricas.habilitar | bool
+
+    - name: "Métricas expuestas"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: {{ metricas_out.content | default('') | regex_findall('^collectd_[a-z_]+', multiline=True) | unique | length }}
+          series distintas en :{{ olvm.metricas.puerto }}
+      when: olvm.metricas.habilitar | bool
+
+- name: "OLVM — que el Prometheus del clúster raspe el laboratorio"
+  hosts: maestro
+  gather_facts: false
+  become: true
+  tags: [metricas]
+
+  tasks:
+    # ScrapeConfig y no ServiceMonitor: los objetivos son VMs FUERA del
+    # clúster, sin Service ni Endpoints que apuntar.
+    - name: "ScrapeConfig con los tres objetivos del laboratorio"
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: present
+        definition:
+          apiVersion: monitoring.coreos.com/v1alpha1
+          kind: ScrapeConfig
+          metadata:
+            name: "{{ olvm.metricas.scrapeconfig }}"
+            namespace: "{{ olvm.metricas.namespace }}"
+            labels:
+              release: monitoring
+          spec:
+            scrapeInterval: "{{ olvm.metricas.intervalo }}"
+            metricsPath: /metrics
+            staticConfigs:
+              - labels:
+                  job: olvm
+                  entorno: curso
+                # regex_replace sobre '$' añade el puerto al final sin usar
+                # retroreferencias, que se destrozan entre capas de escapado.
+                targets: "{{ olvm.vms | map(attribute='ip') | map('regex_replace', '$', ':' ~ olvm.metricas.puerto) | list }}"
+            relabelings:
+              # Etiqueta legible en vez de la IP pelada.
+              - sourceLabels: [__address__]
+                targetLabel: instance
+      when: olvm.metricas.habilitar | bool
+
+    # El contenedor de Prometheus no tiene shell, así que no vale kubectl exec:
+    # se consulta su ClusterIP desde maestro, que sí la alcanza por ser nodo.
+    - name: "IP del servicio de Prometheus"
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Service
+        namespace: "{{ olvm.metricas.namespace }}"
+        name: monitoring-kube-prometheus-prometheus
+      register: svc_prom
+      when: olvm.metricas.habilitar | bool
+
+    - name: "Verificación — Prometheus raspa los tres objetivos"
+      ansible.builtin.uri:
+        url: "http://{{ svc_prom.resources[0].spec.clusterIP }}:9090/api/v1/targets?state=active"
+        return_content: true
+      register: prom_ok
+      until: >-
+        prom_ok.status == 200 and
+        (prom_ok.json.data.activeTargets
+         | selectattr('labels.job', 'equalto', 'olvm')
+         | selectattr('health', 'equalto', 'up') | list | length) >= (olvm.vms | length)
+      retries: 20
+      delay: 15
+      when: olvm.metricas.habilitar | bool
+
+    # Grafana carga los paneles desde ConfigMaps etiquetados grafana_dashboard=1
+    # (los recoge su sidecar grafana-sc-dashboard). No hace falta tocar Grafana.
+    - name: "Panel de Grafana del laboratorio"
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: grafana-dashboard-olvm
+            namespace: "{{ olvm.metricas.namespace }}"
+            labels:
+              grafana_dashboard: "1"
+          data:
+            olvm-dashboard.json: "{{ lookup('file', playbook_dir + '/files/olvm-dashboard.json') }}"
+      when: olvm.metricas.habilitar | bool
+
+    - name: "Objetivos activos en Prometheus"
+      ansible.builtin.debug:
+        msg: >-
+          {{ prom_ok.json.data.activeTargets | selectattr('labels.job','equalto','olvm')
+             | selectattr('health','equalto','up') | map(attribute='labels.instance') | list | join(', ') }}
+          raspados correctamente
+      when: olvm.metricas.habilitar | bool
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 3.44 — CERTIFICADO DEL PORTAL FIRMADO POR LA CA INTERNA
+# ═══════════════════════════════════════════════════════════════════════════
+- name: "OLVM — pedir el certificado del portal a cert-manager"
+  hosts: maestro
+  gather_facts: false
+  become: true
+  tags: [certificado]
+
+  tasks:
+    - name: "Certificate para {{ olvm.vms[0].fqdn }}"
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: present
+        definition:
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: "{{ olvm.certificado.nombre }}"
+            namespace: "{{ olvm.certificado.namespace }}"
+          spec:
+            secretName: "{{ olvm.certificado.nombre }}"
+            duration: 8760h      # 1 año
+            renewBefore: 720h    # renueva 30 días antes
+            commonName: "{{ olvm.vms[0].fqdn }}"
+            dnsNames:
+              - "{{ olvm.vms[0].fqdn }}"
+            ipAddresses:
+              - "{{ olvm.vms[0].ip }}"
+            issuerRef:
+              name: "{{ olvm.certificado.issuer }}"
+              kind: ClusterIssuer
+      when: olvm.certificado.habilitar | bool
+
+    - name: "Esperar a que cert-manager lo emita"
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        api_version: cert-manager.io/v1
+        kind: Certificate
+        namespace: "{{ olvm.certificado.namespace }}"
+        name: "{{ olvm.certificado.nombre }}"
+      register: cert_estado
+      until: >-
+        cert_estado.resources | length > 0 and
+        (cert_estado.resources[0].status.conditions | default([])
+         | selectattr('type','equalto','Ready') | map(attribute='status') | list) == ['True']
+      retries: 30
+      delay: 5
+      when: olvm.certificado.habilitar | bool
+
+    - name: "Leer el secreto con el certificado"
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Secret
+        namespace: "{{ olvm.certificado.namespace }}"
+        name: "{{ olvm.certificado.nombre }}"
+      register: cert_secreto
+      no_log: true
+      when: olvm.certificado.habilitar | bool
+
+    - name: "Publicar el material para el siguiente play"
+      ansible.builtin.set_fact:
+        olvm_cert_crt: "{{ cert_secreto.resources[0].data['tls.crt'] | b64decode }}"
+        olvm_cert_key: "{{ cert_secreto.resources[0].data['tls.key'] | b64decode }}"
+        olvm_cert_ca: "{{ cert_secreto.resources[0].data['ca.crt'] | b64decode }}"
+      no_log: true
+      when: olvm.certificado.habilitar | bool
+
+- name: "OLVM — instalar el certificado en el Apache del engine"
+  hosts: olvm_engine
+  gather_facts: false
+  become: true
+  tags: [certificado]
+
+  tasks:
+    - name: "Copia de seguridad del certificado original"
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ item }}.pre-cm"
+        remote_src: true
+        force: false
+        mode: "0600"
+      loop:
+        - /etc/pki/ovirt-engine/certs/apache.cer
+        - /etc/pki/ovirt-engine/keys/apache.key.nopass
+      when: olvm.certificado.habilitar | bool
+
+    # apache-ca.pem viene como enlace a ca.pem (la CA interna del engine).
+    # Hay que romper el enlace para no pisar la CA que firma los hosts.
+    - name: "Comprobar si apache-ca.pem es un enlace a la CA del engine"
+      ansible.builtin.stat:
+        path: /etc/pki/ovirt-engine/apache-ca.pem
+      register: apache_ca
+      when: olvm.certificado.habilitar | bool
+
+    - name: "Romper el enlace de apache-ca.pem"
+      ansible.builtin.file:
+        path: /etc/pki/ovirt-engine/apache-ca.pem
+        state: absent
+      when:
+        - olvm.certificado.habilitar | bool
+        - apache_ca.stat.islnk | default(false)
+
+    - name: "Instalar certificado, clave y CA"
+      ansible.builtin.copy:
+        dest: "{{ item.destino }}"
+        content: "{{ item.contenido }}"
+        owner: root
+        group: "{{ item.grupo }}"
+        mode: "{{ item.modo }}"
+      loop:
+        - destino: /etc/pki/ovirt-engine/certs/apache.cer
+          contenido: "{{ hostvars['maestro']['olvm_cert_crt'] }}"
+          grupo: root
+          modo: "0644"
+        - destino: /etc/pki/ovirt-engine/keys/apache.key.nopass
+          contenido: "{{ hostvars['maestro']['olvm_cert_key'] }}"
+          grupo: root
+          modo: "0600"
+        - destino: /etc/pki/ovirt-engine/apache-ca.pem
+          contenido: "{{ hostvars['maestro']['olvm_cert_ca'] }}"
+          grupo: root
+          modo: "0644"
+      loop_control:
+        label: "{{ item.destino }}"
+      no_log: true
+      register: cert_instalado
+      when: olvm.certificado.habilitar | bool
+
+    # PASO IMPRESCINDIBLE: el engine llama a su propio SSO por HTTPS y valida
+    # el certificado contra su almacén Java. Si no se le mete ahí la CA nueva,
+    # la API empieza a devolver 401 con "certificate_unknown" en engine.log y
+    # NADIE puede autenticarse, ni por la web ni por API.
+    - name: "Importar la CA del portal en el almacén de confianza del engine"
+      ansible.builtin.command: >-
+        keytool -importcert -noprompt
+        -alias portal-ca-interna
+        -file /etc/pki/ovirt-engine/apache-ca.pem
+        -keystore /etc/pki/ovirt-engine/.truststore
+        -storepass mypass
+      register: keytool_out
+      # keytool escribe sus mensajes informativos en stderr, no en stdout.
+      changed_when: "'added to keystore' in keytool_out.stdout + keytool_out.stderr"
+      failed_when:
+        - keytool_out.rc != 0
+        - "'already exists' not in keytool_out.stderr + keytool_out.stdout"
+      when: olvm.certificado.habilitar | bool
+
+    - name: "Reiniciar Apache y el engine"
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: restarted
+      loop: [httpd, ovirt-engine]
+      when:
+        - olvm.certificado.habilitar | bool
+        - cert_instalado.changed or keytool_out.changed
+
+    - name: "Esperar a que la API vuelva"
+      ansible.builtin.uri:
+        url: "https://{{ olvm.vms[0].fqdn }}/ovirt-engine/api"
+        user: "admin@internal"
+        password: "{{ olvm.admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        headers:
+          Accept: application/json
+        status_code: 200
+      register: api_tras_cert
+      until: api_tras_cert.status == 200
+      retries: 30
+      delay: 10
+      delegate_to: localhost
+      become: false
+      no_log: true
+      when: olvm.certificado.habilitar | bool
+
+    - name: "Verificación — el portal sirve el certificado de la CA interna"
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        echo | openssl s_client -connect localhost:443 -servername {{ olvm.vms[0].fqdn }} 2>/dev/null
+        | openssl x509 -noout -issuer
+      args:
+        executable: /bin/bash
+      register: cert_servido
+      changed_when: false
+      failed_when: "'Internal Cluster CA' not in cert_servido.stdout"
+      when: olvm.certificado.habilitar | bool
+
+    - name: "Emisor del certificado del portal"
+      ansible.builtin.debug:
+        msg: "{{ cert_servido.stdout | trim }}"
+      when: olvm.certificado.habilitar | bool
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 3.46 — PUBLICAR EL PORTAL EN INTERNET POR EL INGRESS PÚBLICO
+# ═══════════════════════════════════════════════════════════════════════════
+# Sólo hay una IP pública y su 443 ya es del ingress de nginx, así que las
+# peticiones que llegan de fuera a olvm.ivanosuna.com mueren en nginx sin que
+# el engine se entere. Aquí se le enseña a nginx ese host y se le manda al
+# engine, que vive FUERA del clúster: de ahí el Service sin selector con los
+# endpoints escritos a mano.
+#
+# nginx termina TLS con Let's Encrypt y vuelve a cifrar hacia el engine sin
+# validar su certificado (lo firma la CA interna, que Let's Encrypt no
+# conoce). En la LAN no cambia nada: /etc/hosts sigue mandando el nombre a la
+# IP de la VM y los playbooks hablan directamente con el engine.
+- name: "OLVM — publicar el portal por el ingress público"
+  hosts: maestro
+  gather_facts: false
+  become: true
+  tags: [publicar]
+
+  vars:
+    olvm_fqdn: "{{ olvm.vms[0].fqdn }}"
+    olvm_ip: "{{ olvm.vms[0].ip }}"
+
+  tasks:
+    - name: "Namespace {{ olvm.publicacion.namespace }}"
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ olvm.publicacion.namespace }}"
+      when: olvm.publicacion.habilitar | bool
+
+    # Sin selector a propósito: no hay pods detrás, hay una VM. Kubernetes no
+    # le genera endpoints solo, se los damos nosotros en la tarea siguiente.
+    - name: "Service sin selector que representa al engine"
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: olvm-engine
+            namespace: "{{ olvm.publicacion.namespace }}"
+          spec:
+            ports:
+              - name: https
+                port: 443
+                targetPort: 443
+                protocol: TCP
+      when: olvm.publicacion.habilitar | bool
+
+    - name: "Endpoints a mano apuntando a la VM del engine"
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: present
+        definition:
+          apiVersion: discovery.k8s.io/v1
+          kind: EndpointSlice
+          metadata:
+            name: olvm-engine
+            namespace: "{{ olvm.publicacion.namespace }}"
+            labels:
+              kubernetes.io/service-name: olvm-engine
+          addressType: IPv4
+          ports:
+            - name: https
+              port: 443
+              protocol: TCP
+          endpoints:
+            - addresses:
+                - "{{ olvm_ip }}"
+              conditions:
+                ready: true
+      when: olvm.publicacion.habilitar | bool
+
+    - name: "Ingress de {{ olvm_fqdn }}"
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: olvm-portal
+            namespace: "{{ olvm.publicacion.namespace }}"
+            annotations:
+              cert-manager.io/cluster-issuer: "{{ olvm.publicacion.issuer }}"
+              # Hacia el engine se habla HTTPS, no HTTP.
+              nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+              # Y sin validar su certificado: lo firma la CA interna del
+              # clúster, no una CA pública. ingress-nginx no valida el
+              # certificado de origen salvo que se le den proxy-ssl-secret y
+              # proxy-ssl-verify; se deja explícito para que se lea.
+              nginx.ingress.kubernetes.io/proxy-ssl-verify: "off"
+              nginx.ingress.kubernetes.io/proxy-ssl-server-name: "on"
+              nginx.ingress.kubernetes.io/proxy-ssl-name: "{{ olvm_fqdn }}"
+              # El global del controlador son 50m y por aquí pasan ISOs y
+              # discos de varios GB.
+              nginx.ingress.kubernetes.io/proxy-body-size: "0"
+              nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+              nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+              nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+              nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
+              # El portal mantiene conexiones largas para los eventos.
+              nginx.ingress.kubernetes.io/configuration-snippet: |
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection "Upgrade";
+          spec:
+            ingressClassName: "{{ olvm.publicacion.ingress_class }}"
+            tls:
+              - hosts:
+                  - "{{ olvm_fqdn }}"
+                secretName: "{{ olvm.publicacion.secreto_tls }}"
+            rules:
+              - host: "{{ olvm_fqdn }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: olvm-engine
+                          port:
+                            number: 443
+      when: olvm.publicacion.habilitar | bool
+
+    # ─── CONSOLA ────────────────────────────────────────────────────────────
+    # El ovirt-websocket-proxy escucha en el 6100 del engine y habla TLS con
+    # el certificado de la CA interna (SSL_ONLY=True). Mismo patrón que el
+    # portal, pero con su propio nombre porque el proxy espera la conexión en
+    # la raíz y no se puede colgar de un subdirectorio del portal.
+    - name: "Service sin selector que representa al websocket proxy"
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: olvm-consola
+            namespace: "{{ olvm.publicacion.namespace }}"
+          spec:
+            ports:
+              - name: https
+                port: 6100
+                targetPort: 6100
+                protocol: TCP
+      when: olvm.publicacion.habilitar | bool
+
+    - name: "Endpoints a mano apuntando al websocket proxy"
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: present
+        definition:
+          apiVersion: discovery.k8s.io/v1
+          kind: EndpointSlice
+          metadata:
+            name: olvm-consola
+            namespace: "{{ olvm.publicacion.namespace }}"
+            labels:
+              kubernetes.io/service-name: olvm-consola
+          addressType: IPv4
+          ports:
+            - name: https
+              port: 6100
+              protocol: TCP
+          endpoints:
+            - addresses:
+                - "{{ olvm_ip }}"
+              conditions:
+                ready: true
+      when: olvm.publicacion.habilitar | bool
+
+    - name: "Ingress de {{ olvm.publicacion.fqdn_consola }}"
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: olvm-consola
+            namespace: "{{ olvm.publicacion.namespace }}"
+            annotations:
+              cert-manager.io/cluster-issuer: "{{ olvm.publicacion.issuer }}"
+              nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+              nginx.ingress.kubernetes.io/proxy-ssl-verify: "off"
+              # Esto es lo que convierte la petición en un websocket. Sin las
+              # cabeceras de Upgrade, nginx cierra la conexión y el alumno ve
+              # la consola en negro.
+              nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+              nginx.ingress.kubernetes.io/configuration-snippet: |
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection "Upgrade";
+              # Una consola abierta es una conexión que no manda nada durante
+              # ratos largos. Con el timeout por defecto se cortaría sola.
+              nginx.ingress.kubernetes.io/proxy-read-timeout: "86400"
+              nginx.ingress.kubernetes.io/proxy-send-timeout: "86400"
+              nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
+              nginx.ingress.kubernetes.io/proxy-buffering: "off"
+          spec:
+            ingressClassName: "{{ olvm.publicacion.ingress_class }}"
+            tls:
+              - hosts:
+                  - "{{ olvm.publicacion.fqdn_consola }}"
+                secretName: "{{ olvm.publicacion.secreto_tls_consola }}"
+            rules:
+              - host: "{{ olvm.publicacion.fqdn_consola }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: olvm-consola
+                          port:
+                            number: 6100
+      when: olvm.publicacion.habilitar | bool
+
+    - name: "Esperar a que Let's Encrypt emita el certificado"
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        api_version: cert-manager.io/v1
+        kind: Certificate
+        namespace: "{{ olvm.publicacion.namespace }}"
+        name: "{{ olvm.publicacion.secreto_tls }}"
+      register: cert_publico
+      until: >-
+        cert_publico.resources | length > 0 and
+        (cert_publico.resources[0].status.conditions | default([])
+         | selectattr('type','equalto','Ready') | map(attribute='status') | list) == ['True']
+      retries: 60
+      delay: 10
+      when: olvm.publicacion.habilitar | bool
+
+    - name: "Esperar a que Let's Encrypt emita el de la consola"
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        api_version: cert-manager.io/v1
+        kind: Certificate
+        namespace: "{{ olvm.publicacion.namespace }}"
+        name: "{{ olvm.publicacion.secreto_tls_consola }}"
+      register: cert_consola
+      until: >-
+        cert_consola.resources | length > 0 and
+        (cert_consola.resources[0].status.conditions | default([])
+         | selectattr('type','equalto','Ready') | map(attribute='status') | list) == ['True']
+      retries: 60
+      delay: 10
+      when: olvm.publicacion.habilitar | bool
+
+    # Desde maestro el nombre resuelve a la VM por /etc/hosts, así que para
+    # probar el camino de fuera hay que forzar la resolución al VIP del
+    # ingress. Es exactamente lo que hará el navegador de un alumno remoto.
+    - name: "Comprobar el portal por el camino público"
+      ansible.builtin.command:
+        cmd: >-
+          curl -s -o /dev/null
+          -w "%{http_code} %{ssl_verify_result}"
+          --resolve {{ olvm_fqdn }}:443:{{ olvm.publicacion.vip }}
+          https://{{ olvm_fqdn }}/ovirt-engine/
+      register: prueba_publica
+      changed_when: false
+      failed_when: prueba_publica.stdout.split()[0] not in ['200', '301', '302']
+      when: olvm.publicacion.habilitar | bool
+
+    - name: "Resultado"
+      ansible.builtin.debug:
+        msg: >-
+          {{ olvm_fqdn }} por el ingress publico: HTTP
+          {{ prueba_publica.stdout.split()[0] }},
+          verificacion TLS {{ prueba_publica.stdout.split()[1] }}
+          (0 = certificado publico valido)
+      when: olvm.publicacion.habilitar | bool
+
+- name: "OLVM — apuntar la consola al nombre publicado"
+  hosts: olvm_engine
+  gather_facts: false
+  become: true
+  tags: [publicar]
+
+  vars:
+    # WebSocketProxy: dónde le dice el engine al navegador que abra el
+    #   websocket. Por defecto se apunta a sí mismo en el 6100, que desde
+    #   Internet no existe.
+    # ClientModeVncDefault: con Native, "Consola" descarga un fichero .vv para
+    #   remote-viewer, que apunta al host KVM en el 5900 — inalcanzable desde
+    #   fuera. Con NoVnc la consola se abre en el propio navegador y viaja por
+    #   el websocket que acabamos de publicar.
+    # ClientModeSpiceDefault: lo mismo para las VMs que usen SPICE en vez de
+    #   VNC (el valor válido aquí es Html5, no HtmlAccess). Las plantillas del
+    #   aula son VNC, pero un alumno puede crear una con SPICE y se encontraría
+    #   otra vez con el .vv.
+    ajustes_consola:
+      WebSocketProxy: "{{ olvm.publicacion.fqdn_consola }}:443"
+      ClientModeVncDefault: "NoVnc"
+      ClientModeSpiceDefault: "Html5"
+
+  tasks:
+    - name: "Valores actuales"
+      ansible.builtin.command:
+        cmd: "/usr/bin/engine-config -g {{ item.key }}"
+      register: config_actual
+      changed_when: false
+      loop: "{{ ajustes_consola | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: olvm.publicacion.habilitar | bool
+
+    - name: "Ajustar lo que no coincida"
+      ansible.builtin.command:
+        cmd: "/usr/bin/engine-config -s {{ item.item.key }}={{ item.item.value }}"
+      loop: "{{ config_actual.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.key }} = {{ item.item.value }}"
+      when:
+        - olvm.publicacion.habilitar | bool
+        - item.stdout is defined
+        - >-
+          (item.item.key ~ ": " ~ item.item.value ~ " ") not in (item.stdout ~ " ")
+      notify: reiniciar el engine
+
+  handlers:
+    # engine-config escribe en la base, pero el engine no relee hasta que se
+    # reinicia. Y desde que el portal está publicado, ese reinicio son unos
+    # dos minutos en los que nginx no tiene backend y todo el mundo ve un 503.
+    # Por eso se avisa antes y se puede desactivar.
+    - name: "AVISO: se va a reiniciar el engine"
+      ansible.builtin.debug:
+        msg: >-
+          Reiniciando ovirt-engine para aplicar los ajustes de consola.
+          El portal dara 503 durante uno o dos minutos.
+      when: olvm.publicacion.reiniciar_engine | default(true) | bool
+      listen: reiniciar el engine
+
+    - name: reiniciar el engine
+      ansible.builtin.systemd:
+        name: ovirt-engine
+        state: restarted
+      when: olvm.publicacion.reiniciar_engine | default(true) | bool
+      listen: reiniciar el engine
+
+    - name: "AVISO: cambio guardado pero SIN aplicar"
+      ansible.builtin.debug:
+        msg: >-
+          Los ajustes de consola estan guardados pero no surtiran efecto hasta
+          que reinicies el engine:  systemctl restart ovirt-engine
+      when: not (olvm.publicacion.reiniciar_engine | default(true) | bool)
+      listen: reiniciar el engine
+
+    - name: "Esperar a que el portal vuelva"
+      ansible.builtin.uri:
+        url: "https://{{ olvm.vms[0].fqdn }}/ovirt-engine/services/health"
+        validate_certs: false
+        status_code: [200]
+      register: salud
+      until: salud.status == 200
+      retries: 60
+      delay: 5
+      listen: reiniciar el engine
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 3.45 — NOTIFICACIONES POR CORREO (contra el mailpit del clúster)
+# ═══════════════════════════════════════════════════════════════════════════
+- name: "OLVM — publicar el SMTP de mailpit para el engine"
+  hosts: maestro
+  gather_facts: false
+  become: true
+  tags: [notificaciones]
+
+  tasks:
+    # mailpit es ClusterIP y el engine es una VM FUERA del clúster: no puede
+    # llegar a una ClusterIP. Se le publica el SMTP con un NodePort, que es lo
+    # menos invasivo (los dos pools de MetalLB tienen una sola IP y ya están
+    # ocupados por los ingress).
+    # Los lookup se ejecutan SIEMPRE en el controlador, que no tiene el
+    # kubeconfig del clúster: hay que consultar con k8s_info, que sí corre
+    # aquí.
+    - name: "Leer el selector del servicio mailpit"
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Service
+        namespace: "{{ olvm.notificaciones.namespace }}"
+        name: "{{ olvm.notificaciones.servicio }}"
+      register: svc_mailpit
+      when: olvm.notificaciones.habilitar | bool
+
+    - name: "Comprobar que mailpit existe"
+      ansible.builtin.assert:
+        that: svc_mailpit.resources | length == 1
+        fail_msg: >-
+          No hay servicio {{ olvm.notificaciones.servicio }} en el namespace
+          {{ olvm.notificaciones.namespace }}
+      when: olvm.notificaciones.habilitar | bool
+
+    - name: "Servicio NodePort para el SMTP de mailpit"
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ olvm.notificaciones.servicio_nodeport }}"
+            namespace: "{{ olvm.notificaciones.namespace }}"
+            labels:
+              app.kubernetes.io/managed-by: ansible
+              proposito: olvm-notificaciones
+          spec:
+            type: NodePort
+            selector: "{{ selector_mailpit }}"
+            ports:
+              - name: smtp
+                port: "{{ olvm.notificaciones.puerto_smtp | int }}"
+                targetPort: "{{ olvm.notificaciones.puerto_smtp | int }}"
+                nodePort: "{{ olvm.notificaciones.nodeport | int }}"
+                protocol: TCP
+      vars:
+        selector_mailpit: "{{ svc_mailpit.resources[0].spec.selector }}"
+      when: olvm.notificaciones.habilitar | bool
+
+    - name: "Verificación — el NodePort responde"
+      ansible.builtin.wait_for:
+        host: "{{ olvm.notificaciones.host_smtp }}"
+        port: "{{ olvm.notificaciones.nodeport | int }}"
+        timeout: 60
+      when: olvm.notificaciones.habilitar | bool
+
+- name: "OLVM — configurar el notificador del engine"
+  hosts: olvm_engine
+  gather_facts: false
+  become: true
+  tags: [notificaciones]
+
+  tasks:
+    - name: "Configuración SMTP del notificador"
+      ansible.builtin.copy:
+        dest: /etc/ovirt-engine/notifier/notifier.conf.d/20-smtp.conf
+        mode: "0644"
+        content: |
+          # Notificaciones de OLVM hacia el mailpit del clúster de Kubernetes.
+          # Lo genera 3-19-olvm-engine.yaml.
+          MAIL_SERVER={{ olvm.notificaciones.host_smtp }}
+          MAIL_PORT={{ olvm.notificaciones.nodeport }}
+          MAIL_ENABLE_SSL=false
+          MAIL_USER=
+          MAIL_PASSWORD=
+          MAIL_FROM={{ olvm.notificaciones.remitente }}
+          FILTER="include:*:{{ olvm.notificaciones.severidad }}(smtp:{{ olvm.notificaciones.destinatario }}) ${FILTER}"
+      register: conf_notifier
+      when: olvm.notificaciones.habilitar | bool
+
+    - name: "Arrancar el notificador"
+      ansible.builtin.systemd_service:
+        name: ovirt-engine-notifier
+        state: "{{ 'restarted' if conf_notifier.changed else 'started' }}"
+        enabled: true
+      when: olvm.notificaciones.habilitar | bool
+
+    - name: "Verificación — el notificador está activo"
+      ansible.builtin.command: "systemctl is-active ovirt-engine-notifier"
+      register: est_notifier
+      changed_when: false
+      failed_when: est_notifier.stdout != 'active'
+      when: olvm.notificaciones.habilitar | bool
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 3.5 — AUTORIZAR AL ENGINE EN LOS HOSTS
+# ═══════════════════════════════════════════════════════════════════════════
+# Para desplegar vdsm, el engine entra por SSH como root en cada host. Se usa
+# autenticación por clave (public_key: true en ovirt_host) en vez de dar la
+# contraseña de root, que en estas imágenes cloud ni siquiera existe.
+- name: "OLVM — autorizar la clave del engine en root de los hosts"
+  hosts: olvm_host
+  gather_facts: false
+  become: true
+  tags: [hosts]
+
+  vars:
+    olvm_host_api: "{{ olvm.dns_local | ternary(olvm.vms[0].fqdn, olvm.vms[0].ip) }}"
+    # Con qué CA se valida la API DESDE EL CONTROLADOR. Desde que el registro
+    # del router manda olvm.ivanosuna.com al ingress también dentro de la LAN,
+    # quien pregunta por el nombre ve el certificado de Let's Encrypt, no el de
+    # la CA interna: se valida con el almacén del sistema, o sea sin ca_file.
+    # Las tareas de subida son otra cosa y siguen con su bundle: se delegan al
+    # host KVM, que tiene el nombre en /etc/hosts y habla con la VM directamente.
+    olvm_ca_api: "{{ olvm.publicacion.ca_publica
+                    if (olvm.publicacion.habilitar | default(false) | bool)
+                    else (olvm.dns_local | ternary('/tmp/olvm-ca.pem', omit)) }}"
+
+  tasks:
+    - name: "Obtener la clave pública SSH del engine"
+      ansible.builtin.uri:
+        url: >-
+          http://{{ olvm_host_api }}/ovirt-engine/services/pki-resource?resource=engine-certificate&format=OPENSSH-PUBKEY
+        return_content: true
+        validate_certs: false
+      register: engine_pubkey
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: "Autorizarla en la cuenta root del host"
+      ansible.posix.authorized_key:
+        user: root
+        key: "{{ engine_pubkey.content | trim }}"
+        state: present
+
+    - name: "Verificación — root del host acepta la clave del engine"
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        grep -cF "{{ engine_pubkey.content | trim | regex_replace('\\s+$', '') }}" /root/.ssh/authorized_keys
+      args:
+        executable: /bin/bash
+      register: key_ok
+      changed_when: false
+      failed_when: key_ok.stdout | int < 1
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 4 — DATA CENTER, CLÚSTER Y ALTA DE HOSTS
+# ═══════════════════════════════════════════════════════════════════════════
+# A partir de aquí se habla con la API REST del engine desde el controlador,
+# vía la colección ovirt.ovirt. No se toca ninguna VM por SSH.
+- name: "OLVM — configurar Data Center, clúster y hosts"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  # SIN tags a nivel de play: si se ponen aquí, cada tarea hereda todas y
+  # --tags datacenter acaba dando de alta los hosts.
+
+  vars:
+    olvm_host_api: "{{ olvm.dns_local | ternary(olvm.vms[0].fqdn, olvm.vms[0].ip) }}"
+    # Con qué CA se valida la API DESDE EL CONTROLADOR. Desde que el registro
+    # del router manda olvm.ivanosuna.com al ingress también dentro de la LAN,
+    # quien pregunta por el nombre ve el certificado de Let's Encrypt, no el de
+    # la CA interna: se valida con el almacén del sistema, o sea sin ca_file.
+    # Las tareas de subida son otra cosa y siguen con su bundle: se delegan al
+    # host KVM, que tiene el nombre en /etc/hosts y habla con la VM directamente.
+    olvm_ca_api: "{{ olvm.publicacion.ca_publica
+                    if (olvm.publicacion.habilitar | default(false) | bool)
+                    else (olvm.dns_local | ternary('/tmp/olvm-ca.pem', omit)) }}"
+    # ovirt_disk necesita qemu-img y el SDK de oVirt en la máquina donde se
+    # ejecuta. El controlador (un Mac) no tiene qemu-img, pero los hosts KVM
+    # tienen los dos de serie: la subida se delega al primero.
+    olvm_uploader: "{{ (olvm.vms | selectattr('rol', 'equalto', 'host') | first).nombre }}"
+    plantilla_aula: "{{ olvm.plantillas | selectattr('nombre', 'equalto', olvm.plantilla_alumnos) | first }}"
+    cloud_init_aula:
+      user_name: "{{ (olvm.plantillas | selectattr('nombre', 'equalto', olvm.plantilla_alumnos) | first).usuario | default('alumno') }}"
+      root_password: "{{ olvm.password_invitado }}"
+      custom_script: |
+        password: {{ olvm.password_invitado }}
+        chpasswd: {expire: False}
+        ssh_pwauth: true
+        packages:
+          - qemu-guest-agent
+        runcmd:
+          - [ systemctl, enable, --now, qemu-guest-agent ]
+
+  tasks:
+    # De dónde sale la CA con la que validamos la API:
+    #  - Si el portal lleva el certificado de cert-manager, la firma la CA
+    #    interna del clúster. El endpoint pki-resource del engine sigue
+    #    sirviendo SU CA interna (la que firma a los hosts), que ya no vale
+    #    para validar la web.
+    #  - Si no, la del propio engine.
+    - name: "CA interna del clúster (firma el certificado del portal)"
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Secret
+        namespace: cert-manager
+        name: internal-ca-secret
+      register: ca_cluster
+      delegate_to: maestro
+      become: true
+      # Sin esto, el connection: local del play haría que el become se
+      # ejecutara en el controlador en vez de en maestro.
+      vars:
+        ansible_connection: ssh
+      no_log: true
+      when:
+        - olvm.dns_local
+        - olvm.certificado.habilitar | bool
+      tags: [datacenter, hosts, storage, isos, plantilla, aula, red, usuarios, verificar]
+
+    - name: "Vaciar el directorio de CAs"
+      ansible.builtin.file:
+        path: "/tmp/olvm-ca.d"
+        state: "{{ item }}"
+        mode: "0755"
+      loop: [absent, directory]
+      changed_when: false
+      when: olvm.dns_local | bool
+      tags: [datacenter, hosts, storage, isos, plantilla, aula, red, usuarios, verificar]
+
+    - name: "Guardar la CA interna en el controlador"
+      ansible.builtin.copy:
+        content: "{{ ca_cluster.resources[0].data['tls.crt'] | b64decode }}"
+        dest: "{{ item }}"
+        mode: "0644"
+      loop:
+        - "/tmp/olvm-ca.pem"
+        - "/tmp/olvm-ca.d/10-cluster.pem"
+      no_log: true
+      when:
+        - olvm.dns_local
+        - olvm.certificado.habilitar | bool
+      tags: [datacenter, hosts, storage, isos, plantilla, aula, red, usuarios, verificar]
+
+    # La CA propia del engine siempre hace falta, aunque el portal lleve otra:
+    # la subida de discos NO habla con el portal, habla con imageio, y imageio
+    # sigue presentando el certificado firmado por la CA del engine.
+    - name: "CA del engine"
+      ansible.builtin.get_url:
+        url: "http://{{ olvm_host_api }}/ovirt-engine/services/pki-resource?resource=ca-certificate&format=X509-PEM-CA"
+        dest: "/tmp/olvm-ca.d/20-engine.pem"
+        mode: "0644"
+        validate_certs: false
+      when: olvm.dns_local | bool
+      tags: [datacenter, hosts, storage, isos, plantilla, aula, red, usuarios, verificar]
+
+    - name: "CA del engine como CA de la API (portal sin certificado propio)"
+      ansible.builtin.copy:
+        src: "/tmp/olvm-ca.d/20-engine.pem"
+        dest: "/tmp/olvm-ca.pem"
+        mode: "0644"
+        remote_src: true
+      when:
+        - olvm.dns_local
+        - not (olvm.certificado.habilitar | bool)
+      tags: [datacenter, hosts, storage, isos, plantilla, aula, red, usuarios, verificar]
+
+    # Bundle para las subidas: el módulo ovirt_disk usa UNA sola ca_file para
+    # dos extremos distintos —la API (CA interna del clúster) e imageio (CA del
+    # engine)—, así que necesita las dos juntas o falla la validación TLS.
+    - name: "Bundle de CAs para las subidas de imágenes"
+      ansible.builtin.assemble:
+        src: "/tmp/olvm-ca.d"
+        dest: "/tmp/olvm-ca-bundle.pem"
+        mode: "0644"
+      when: olvm.dns_local | bool
+      tags: [isos, plantilla]
+
+    - name: "Autenticarse contra el engine"
+      ovirt.ovirt.ovirt_auth:
+        url: "https://{{ olvm_host_api }}/ovirt-engine/api"
+        username: "admin@internal"
+        password: "{{ olvm.admin_password }}"
+        ca_file: "{{ olvm_ca_api }}"
+        insecure: "{{ not (olvm.dns_local or olvm.publicacion.habilitar | default(false) | bool) }}"
+      # ovirt_auth publica un fact llamado ovirt_auth; no hay que registrarlo.
+      tags: [datacenter, hosts, storage, isos, plantilla, aula, red, usuarios, verificar]
+
+    - name: "Data Center {{ olvm.datacenter }}"
+      ovirt.ovirt.ovirt_datacenter:
+        auth: "{{ ovirt_auth }}"
+        name: "{{ olvm.datacenter }}"
+        description: "Laboratorio del curso de OLVM"
+        local: false
+        state: present
+      tags: [datacenter]
+
+    # El tipo de CPU es LA decisión que rompe el laboratorio si se deja en
+    # automático: el engine detecta el del primer host que se da de alta y el
+    # segundo no puede unirse ni recibir migraciones.
+    - name: "Crear el clúster con el tipo de CPU fijado: {{ olvm.cluster }}"
+      ovirt.ovirt.ovirt_cluster:
+        auth: "{{ ovirt_auth }}"
+        name: "{{ olvm.cluster }}"
+        data_center: "{{ olvm.datacenter }}"
+        cpu_type: "{{ olvm.tipo_cpu }}"
+        description: "Mac mini 2012 Ivy Bridge - minimo comun denominador"
+        ballooning: true
+        state: present
+      tags: [datacenter]
+
+    # Un host que quedó en install_failed no se recupera con state: present
+    # (el engine lo ve "ya existente" y no reintenta nada). Hay que sacarlo y
+    # volver a darlo de alta.
+    - name: "Ver en qué estado están los hosts en el engine"
+      ovirt.ovirt.ovirt_host_info:
+        auth: "{{ ovirt_auth }}"
+        pattern: "cluster={{ olvm.cluster }}"
+      register: hosts_previos
+      tags: [hosts]
+
+    # El módulo ovirt_host se niega a tocar un host en install_failed
+    # ("Not possible to manage host in state install_failed"), incluso para
+    # pasarlo a mantenimiento. La API REST sí lo borra con force=true, así
+    # que la retirada se hace por ahí.
+    - name: "Retirar por API los hosts de un despliegue fallido"
+      ansible.builtin.uri:
+        url: "https://{{ olvm_host_api }}/ovirt-engine/api/hosts/{{ item.id }}?force=true"
+        method: DELETE
+        user: "admin@internal"
+        password: "{{ olvm.admin_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ olvm.dns_local }}"
+        # El módulo uri valida contra el almacén del sistema, que no conoce la
+        # CA interna del engine: hay que indicársela explícitamente.
+        ca_path: "{{ olvm_ca_api }}"
+        status_code: [200, 202, 204]
+      loop: "{{ hosts_previos.ovirt_hosts | selectattr('status', 'in', ['install_failed', 'non_responsive', 'non_operational']) | list }}"
+      loop_control:
+        label: "{{ item.name }} (estaba en {{ item.status }})"
+      no_log: true
+      tags: [hosts]
+
+    - name: "Alta de los hosts KVM (instala vdsm, tarda varios minutos cada uno)"
+      ovirt.ovirt.ovirt_host:
+        auth: "{{ ovirt_auth }}"
+        name: "{{ item.nombre }}"
+        address: "{{ item.ip }}"
+        cluster: "{{ olvm.cluster }}"
+        public_key: true
+        state: present
+        timeout: 1800
+      loop: "{{ olvm.vms | selectattr('rol', 'equalto', 'host') | list }}"
+      loop_control:
+        label: "{{ item.nombre }} ({{ item.ip }})"
+      tags: [hosts]
+
+    # ─── STORAGE ────────────────────────────────────────────────────────────
+    - name: "Storage domain NFS {{ olvm.storage_domain }}"
+      ovirt.ovirt.ovirt_storage_domain:
+        auth: "{{ ovirt_auth }}"
+        name: "{{ olvm.storage_domain }}"
+        domain_function: data
+        # Cualquier host Up del DC sirve para montarlo; usamos el primero.
+        host: "{{ (olvm.vms | selectattr('rol', 'equalto', 'host') | first).nombre }}"
+        data_center: "{{ olvm.datacenter }}"
+        nfs:
+          address: "{{ olvm.nfs.servidor }}"
+          path: "{{ olvm.nfs.ruta }}"
+        state: present
+      tags: [storage]
+
+    # ─── RED DE LOS ALUMNOS ─────────────────────────────────────────────────
+    # Red lógica aparte de ovirtmgmt, sobre la segunda NIC de los hosts (la
+    # que cuelga del bridge br-olvm). Es la que da salida REAL a la LAN a las
+    # VMs de los alumnos: ovirtmgmt va por macvtap y filtra las MACs
+    # anidadas. Además da algo que enseñar: crear una red lógica y asignarla
+    # a un interfaz de host es ejercicio de curso.
+    - name: "Red lógica {{ olvm.red.red_alumnos }}"
+      ovirt.ovirt.ovirt_network:
+        auth: "{{ ovirt_auth }}"
+        name: "{{ olvm.red.red_alumnos }}"
+        data_center: "{{ olvm.datacenter }}"
+        description: "Red de las VMs de los alumnos - salida a la LAN"
+        vm_network: true
+        clusters:
+          - name: "{{ olvm.cluster }}"
+            assigned: true
+            required: false
+        state: present
+      tags: [red]
+
+    # La segunda NIC se añade en caliente a la VM del host, así que el engine
+    # no la conoce hasta que refresca capacidades. Sin esto falla con
+    # "The host network interface (id null, name eth1) does not exist".
+    - name: "Refrescar las capacidades de los hosts"
+      ovirt.ovirt.ovirt_host:
+        auth: "{{ ovirt_auth }}"
+        name: "{{ item.nombre }}"
+        state: refreshed
+        timeout: 600
+      loop: "{{ olvm.vms | selectattr('rol', 'equalto', 'host') | list }}"
+      loop_control:
+        label: "{{ item.nombre }}"
+      tags: [red]
+
+    - name: "Asignar la red a la segunda NIC de cada host"
+      ovirt.ovirt.ovirt_host_network:
+        auth: "{{ ovirt_auth }}"
+        name: "{{ item.nombre }}"
+        interface: "eth1"
+        networks:
+          - name: "{{ olvm.red.red_alumnos }}"
+        state: present
+        check: true
+        save: true
+      loop: "{{ olvm.vms | selectattr('rol', 'equalto', 'host') | list }}"
+      loop_control:
+        label: "{{ item.nombre }} eth1"
+      tags: [red]
+
+    # Segundo dominio: sin él no se puede enseñar a mover discos entre
+    # dominios ni a poner uno en mantenimiento.
+    - name: "Segundo storage domain {{ olvm.storage_domain_2 }}"
+      ovirt.ovirt.ovirt_storage_domain:
+        auth: "{{ ovirt_auth }}"
+        name: "{{ olvm.storage_domain_2 }}"
+        domain_function: data
+        host: "{{ (olvm.vms | selectattr('rol', 'equalto', 'host') | first).nombre }}"
+        data_center: "{{ olvm.datacenter }}"
+        nfs:
+          address: "{{ olvm.nfs.servidor }}"
+          path: "{{ olvm.nfs.ruta_2 }}"
+        state: present
+      tags: [storage]
+
+    # Las tareas de subida se delegan al host KVM, así que la CA tiene que
+    # existir ALLÍ, no en el controlador: el módulo la abre donde se ejecuta.
+    - name: "Llevar el bundle de CAs al host que sube las imágenes"
+      ansible.builtin.copy:
+        src: /tmp/olvm-ca-bundle.pem
+        dest: /var/tmp/olvm-ca.pem
+        mode: "0644"
+      delegate_to: "{{ olvm_uploader }}"
+      become: true
+      when: olvm.dns_local | bool
+      tags: [isos, plantilla]
+
+    # ─── ISOs ───────────────────────────────────────────────────────────────
+    - name: "Descargar los ISOs en el host que los subirá"
+      ansible.builtin.get_url:
+        url: "{{ item.url }}"
+        dest: "/var/tmp/iso-{{ item.nombre }}.iso"
+        checksum: "sha256:{{ item.sha256 }}"
+        mode: "0644"
+      loop: "{{ olvm.isos | default([]) }}"
+      loop_control:
+        label: "{{ item.nombre }}"
+      delegate_to: "{{ olvm_uploader }}"
+      become: true
+      tags: [isos]
+
+    - name: "Subir los ISOs al storage domain"
+      ovirt.ovirt.ovirt_disk:
+        # ca_file reapuntada a la copia local del host delegado.
+        auth: "{{ ovirt_auth | combine({'ca_file': '/var/tmp/olvm-ca.pem'}) if olvm.dns_local | bool else ovirt_auth }}"
+        name: "{{ item.nombre }}"
+        upload_image_path: "/var/tmp/iso-{{ item.nombre }}.iso"
+        storage_domain: "{{ olvm.storage_domain }}"
+        content_type: iso
+        format: raw
+        wait: true
+        timeout: 1800
+      loop: "{{ olvm.isos | default([]) }}"
+      loop_control:
+        label: "{{ item.nombre }}"
+      delegate_to: "{{ olvm_uploader }}"
+      become: true
+      tags: [isos]
+
+    # ─── PLANTILLAS ─────────────────────────────────────────────────────────
+    # Se crean todas las de olvm.plantillas. Cada una: descargar la imagen en
+    # el host que sube, subirla como disco, montar una VM base y sellarla.
+    - name: "Plantillas que ya existen"
+      ovirt.ovirt.ovirt_template_info:
+        auth: "{{ ovirt_auth }}"
+        pattern: "name=*"
+      register: info_plantillas
+      tags: [plantilla]
+
+    - name: "Descargar las imágenes que faltan"
+      ansible.builtin.get_url:
+        url: "{{ item.url }}"
+        dest: "/var/tmp/plantilla-{{ item.nombre }}.qcow2"
+        checksum: "{{ item.checksum }}"
+        mode: "0644"
+        timeout: 120
+      loop: "{{ olvm.plantillas }}"
+      loop_control:
+        label: "{{ item.nombre }}"
+      when: item.nombre not in (info_plantillas.ovirt_templates | map(attribute='name') | list)
+      delegate_to: "{{ olvm_uploader }}"
+      become: true
+      tags: [plantilla]
+
+    - name: "Subir cada imagen como disco"
+      ovirt.ovirt.ovirt_disk:
+        auth: "{{ ovirt_auth | combine({'ca_file': '/var/tmp/olvm-ca.pem'}) if olvm.dns_local | bool else ovirt_auth }}"
+        name: "{{ item.nombre }}-disco"
+        upload_image_path: "/var/tmp/plantilla-{{ item.nombre }}.qcow2"
+        storage_domain: "{{ olvm.storage_domain }}"
+        format: cow
+        bootable: true
+        wait: true
+        timeout: 1800
+      loop: "{{ olvm.plantillas }}"
+      loop_control:
+        label: "{{ item.nombre }}"
+      when: item.nombre not in (info_plantillas.ovirt_templates | map(attribute='name') | list)
+      delegate_to: "{{ olvm_uploader }}"
+      become: true
+      tags: [plantilla]
+
+    - name: "VM base de cada plantilla"
+      ovirt.ovirt.ovirt_vm:
+        auth: "{{ ovirt_auth }}"
+        name: "{{ item.nombre }}-base"
+        cluster: "{{ olvm.cluster }}"
+        memory: "{{ item.memoria_mb }}MiB"
+        cpu_cores: "{{ item.vcpus }}"
+        operating_system: "{{ item.so }}"
+        type: server
+        disks:
+          - name: "{{ item.nombre }}-disco"
+            bootable: true
+        nics:
+          - name: nic1
+            profile_name: "{{ olvm.red.red_alumnos }}"
+        state: stopped
+        wait: true
+        timeout: 900
+      loop: "{{ olvm.plantillas }}"
+      loop_control:
+        label: "{{ item.nombre }}-base"
+      when: item.nombre not in (info_plantillas.ovirt_templates | map(attribute='name') | list)
+      tags: [plantilla]
+
+    # OJO: oVirt rechaza descripciones con acentos, rayas o dos puntos.
+    - name: "Sellar cada VM base como plantilla"
+      ovirt.ovirt.ovirt_template:
+        auth: "{{ ovirt_auth }}"
+        name: "{{ item.nombre }}"
+        vm: "{{ item.nombre }}-base"
+        cluster: "{{ olvm.cluster }}"
+        description: "{{ item.nota }}"
+        state: present
+        wait: true
+        timeout: 1800
+      loop: "{{ olvm.plantillas }}"
+      loop_control:
+        label: "{{ item.nombre }}"
+      when: item.nombre not in (info_plantillas.ovirt_templates | map(attribute='name') | list)
+      tags: [plantilla]
+
+    # ─── AULA: UNA VM POR ALUMNO ────────────────────────────────────────────
+    # Clon fino de la plantilla. Ver el porqué de no usar un VM pool en el
+    # bloque olvm.aula de desa.yaml.
+    - name: "Retirar el VM pool si quedó de una versión anterior"
+      ovirt.ovirt.ovirt_vmpool:
+        auth: "{{ ovirt_auth }}"
+        name: "aula"
+        state: absent
+        wait: true
+        timeout: 900
+      failed_when: false
+      tags: [aula]
+
+    - name: "Crear la VM de cada alumno a partir de la plantilla"
+      ovirt.ovirt.ovirt_vm:
+        auth: "{{ ovirt_auth }}"
+        name: "{{ olvm.aula.prefijo_vm }}{{ item }}"
+        template: "{{ plantilla_aula.nombre }}"
+        cluster: "{{ olvm.cluster }}"
+        memory: "{{ plantilla_aula.memoria_mb }}MiB"
+        cpu_cores: "{{ plantilla_aula.vcpus }}"
+        comment: "VM de practicas de {{ item }}"
+        # Con una plantilla que trae cloud-init, OLVM le inyecta al primer
+        # arranque el hostname, el usuario y la contraseña, e instala el
+        # qemu-guest-agent para que la pestaña "Información del huésped"
+        # muestre IP y SO. Con CirrOS no hay nada de esto: sólo consola.
+        cloud_init: "{{ cloud_init_aula if plantilla_aula.cloud_init | bool else omit }}"
+        cloud_init_persist: "{{ true if plantilla_aula.cloud_init | bool else omit }}"
+        state: stopped
+        wait: true
+        timeout: 900
+      loop: "{{ range(1, olvm.alumnos.cantidad + 1) | map('regex_replace', '^(.*)$', olvm.alumnos.prefijo ~ '\\1') | list }}"
+      loop_control:
+        label: "{{ olvm.aula.prefijo_vm }}{{ item }}"
+      tags: [aula]
+
+    - name: "Poner la NIC de cada VM de alumno en la red {{ olvm.red.red_alumnos }}"
+      # La plantilla nace en ovirtmgmt (macvtap, sin salida real). Las VMs de
+      # los alumnos se mueven a la red del bridge, que sí sale a la LAN.
+      ovirt.ovirt.ovirt_nic:
+        auth: "{{ ovirt_auth }}"
+        vm: "{{ olvm.aula.prefijo_vm }}{{ item }}"
+        name: nic1
+        profile: "{{ olvm.red.red_alumnos }}"
+        network: "{{ olvm.red.red_alumnos }}"
+        state: present
+      loop: "{{ range(1, olvm.alumnos.cantidad + 1) | map('regex_replace', '^(.*)$', olvm.alumnos.prefijo ~ '\\1') | list }}"
+      loop_control:
+        label: "{{ olvm.aula.prefijo_vm }}{{ item }}"
+      tags: [red, aula]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 5 — USUARIOS DE ALUMNO (parte interna, en el engine)
+# ═══════════════════════════════════════════════════════════════════════════
+# Los usuarios internos viven en la base aaa-jdbc del engine y sólo se crean
+# con su herramienta; la API REST no los da de alta, sólo los referencia.
+- name: "OLVM — crear los usuarios de alumno en aaa-jdbc"
+  hosts: olvm_engine
+  gather_facts: false
+  become: true
+  tags: [usuarios]
+
+  vars:
+    alumnos: >-
+      {{ range(1, olvm.alumnos.cantidad + 1)
+         | map('regex_replace', '^(.*)$', olvm.alumnos.prefijo ~ '\1') | list }}
+
+  tasks:
+    # OJO: esta versión de ovirt-aaa-jdbc-tool NO tiene "user list"
+    # (sus subcomandos son add, edit, delete, unlock, password-reset, show).
+    # Para enumerar hay que usar el módulo query.
+    - name: "Listar los usuarios internos que ya existen"
+      ansible.builtin.command: "ovirt-aaa-jdbc-tool query --what=user"
+      register: usuarios_existentes
+      changed_when: false
+
+    - name: "Crear el usuario de cada alumno"
+      ansible.builtin.command: >-
+        ovirt-aaa-jdbc-tool user add {{ item }}
+        --attribute=firstName={{ item }}
+        --attribute=department=curso-olvm
+      loop: "{{ alumnos }}"
+      when: item not in usuarios_existentes.stdout
+      changed_when: true
+
+    # Sin "when": se aplica siempre. Es idempotente (fijar la misma contraseña
+    # no cambia nada) y evita el agujero de que el usuario ya exista de un
+    # intento anterior y se quede sin contraseña para siempre.
+    # La fecha va entrecomillada: lleva un espacio y el módulo command parte
+    # los argumentos con shlex, así que sin comillas llegan dos argumentos.
+    - name: "Fijar la contraseña de cada alumno"
+      ansible.builtin.command: >-
+        ovirt-aaa-jdbc-tool user password-reset {{ item }}
+        --password=pass:{{ olvm.alumnos.password }}
+        --password-valid-to="2100-01-01 00:00:00Z"
+      loop: "{{ alumnos }}"
+      register: pw_alumnos
+      # "new password already used" es la política de aaa-jdbc rechazando
+      # reutilizar una contraseña: significa que ya está puesta la que
+      # queremos, así que es éxito, no error.
+      changed_when: "'updated successfully' in pw_alumnos.stdout"
+      failed_when:
+        - pw_alumnos.rc != 0
+        - "'new password already used' not in pw_alumnos.stderr"
+      no_log: true
+
+    - name: "Verificación — existen todos los alumnos: {{ olvm.alumnos.cantidad }}"
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        ovirt-aaa-jdbc-tool query --what=user | grep -cE '^Name: {{ olvm.alumnos.prefijo }}[0-9]+$'
+      args:
+        executable: /bin/bash
+      register: cuenta_alumnos
+      changed_when: false
+      failed_when: cuenta_alumnos.stdout | int != olvm.alumnos.cantidad
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 6 — PERMISOS DE LOS ALUMNOS Y VERIFICACIÓN FINAL
+# ═══════════════════════════════════════════════════════════════════════════
+- name: "OLVM — permisos de los alumnos y verificación del laboratorio"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    olvm_host_api: "{{ olvm.dns_local | ternary(olvm.vms[0].fqdn, olvm.vms[0].ip) }}"
+    # Con qué CA se valida la API DESDE EL CONTROLADOR. Desde que el registro
+    # del router manda olvm.ivanosuna.com al ingress también dentro de la LAN,
+    # quien pregunta por el nombre ve el certificado de Let's Encrypt, no el de
+    # la CA interna: se valida con el almacén del sistema, o sea sin ca_file.
+    # Las tareas de subida son otra cosa y siguen con su bundle: se delegan al
+    # host KVM, que tiene el nombre en /etc/hosts y habla con la VM directamente.
+    olvm_ca_api: "{{ olvm.publicacion.ca_publica
+                    if (olvm.publicacion.habilitar | default(false) | bool)
+                    else (olvm.dns_local | ternary('/tmp/olvm-ca.pem', omit)) }}"
+    alumnos: >-
+      {{ range(1, olvm.alumnos.cantidad + 1)
+         | map('regex_replace', '^(.*)$', olvm.alumnos.prefijo ~ '\1') | list }}
+
+  tasks:
+    - name: "Autenticarse contra el engine"
+      ovirt.ovirt.ovirt_auth:
+        url: "https://{{ olvm_host_api }}/ovirt-engine/api"
+        username: "admin@internal"
+        password: "{{ olvm.admin_password }}"
+        ca_file: "{{ olvm_ca_api }}"
+        insecure: "{{ not (olvm.dns_local or olvm.publicacion.habilitar | default(false) | bool) }}"
+      # ovirt_auth publica un fact llamado ovirt_auth; no hay que registrarlo.
+      tags: [datacenter, hosts, storage, isos, plantilla, aula, red, usuarios, verificar]
+
+    - name: "Registrar a cada alumno en el engine"
+      ovirt.ovirt.ovirt_user:
+        auth: "{{ ovirt_auth }}"
+        name: "{{ item }}"
+        authz_name: internal-authz
+        state: present
+      loop: "{{ alumnos }}"
+      tags: [usuarios]
+
+    # UserVmManager y NO UserRole: UserRole sólo deja VER la VM y conectarse
+    # a su consola; arrancarla o pararla devuelve "User is not authorized to
+    # perform this action". Para un curso de OPERACIÓN hace falta
+    # UserVmManager, que da el ciclo de vida completo sobre las VMs que el
+    # alumno controla, sin ver las de los demás.
+    # UserVmManager sobre SU VM: da ciclo de vida completo (arrancar, parar,
+    # consola, snapshots, discos, NICs) y sólo sobre la suya. UserRole, que
+    # es lo que concede un VM pool, no llega a los snapshots.
+    - name: "Dar a cada alumno control total sobre su VM"
+      ovirt.ovirt.ovirt_permission:
+        auth: "{{ ovirt_auth }}"
+        user_name: "{{ item }}"
+        authz_name: internal-authz
+        object_type: vm
+        object_name: "{{ olvm.aula.prefijo_vm }}{{ item }}"
+        role: UserVmManager
+        state: present
+      loop: "{{ alumnos }}"
+      tags: [usuarios]
+
+    # ─── AUTOSERVICIO ───────────────────────────────────────────────────────
+    # Rol administrativo: se concede sobre "system" para SuperUser y sobre el
+    # clúster para el resto. Lo incluye todo, así que cuando está activo los
+    # permisos finos de abajo son redundantes (se dejan por si se vuelve a un
+    # modelo restringido cambiando olvm.rol_alumnos).
+    - name: "Dar rol {{ olvm.rol_alumnos }} a cada alumno"
+      ovirt.ovirt.ovirt_permission:
+        auth: "{{ ovirt_auth }}"
+        user_name: "{{ item }}"
+        authz_name: internal-authz
+        object_type: "{{ 'system' if olvm.rol_alumnos == 'SuperUser' else 'cluster' }}"
+        object_name: "{{ omit if olvm.rol_alumnos == 'SuperUser' else olvm.cluster }}"
+        role: "{{ olvm.rol_alumnos }}"
+        state: present
+      loop: "{{ alumnos }}"
+      when: olvm.rol_alumnos | default('') | length > 0
+      tags: [usuarios]
+
+    # OJO: el permiso create_vm se evalúa contra el CLÚSTER, no contra la
+    # plantilla. Con el rol sólo en las plantillas el alumno las ve pero al
+    # crear recibe "User is not authorized to perform this action".
+    - name: "Dejar a los alumnos crear VMs en el clúster"
+      ovirt.ovirt.ovirt_permission:
+        auth: "{{ ovirt_auth }}"
+        user_name: "{{ item }}"
+        authz_name: internal-authz
+        object_type: cluster
+        object_name: "{{ olvm.cluster }}"
+        role: UserTemplateBasedVm
+        state: present
+      loop: "{{ alumnos }}"
+      when: olvm.autoservicio | bool
+      tags: [usuarios]
+
+    - name: "Dejar a los alumnos ver y usar las plantillas"
+      ovirt.ovirt.ovirt_permission:
+        auth: "{{ ovirt_auth }}"
+        user_name: "{{ item.0 }}"
+        authz_name: internal-authz
+        object_type: template
+        object_name: "{{ item.1 }}"
+        role: UserTemplateBasedVm
+        state: present
+      loop: "{{ alumnos | product(olvm.plantillas | map(attribute='nombre') | list) | list }}"
+      loop_control:
+        label: "{{ item.0 }} -> {{ item.1 }}"
+      when: olvm.autoservicio | bool
+      tags: [usuarios]
+
+    - name: "Dejar a los alumnos crear discos en el almacenamiento"
+      ovirt.ovirt.ovirt_permission:
+        auth: "{{ ovirt_auth }}"
+        user_name: "{{ item.0 }}"
+        authz_name: internal-authz
+        object_type: storage_domain
+        object_name: "{{ item.1 }}"
+        role: DiskCreator
+        state: present
+      loop: "{{ alumnos | product([olvm.storage_domain, olvm.storage_domain_2]) | list }}"
+      loop_control:
+        label: "{{ item.0 }} -> {{ item.1 }}"
+      when: olvm.autoservicio | bool
+      tags: [usuarios]
+
+    # ─── VERIFICACIÓN ───────────────────────────────────────────────────────
+    - name: "Recoger el estado del laboratorio"
+      ovirt.ovirt.ovirt_host_info:
+        auth: "{{ ovirt_auth }}"
+        pattern: "cluster={{ olvm.cluster }}"
+      register: info_hosts
+      tags: [verificar]
+
+    # Un dominio ya adjuntado a un Data Center NO expone "status" en la vista
+    # global /storagedomains: hay que consultarlo dentro del DC.
+    - name: "Datos del Data Center"
+      ovirt.ovirt.ovirt_datacenter_info:
+        auth: "{{ ovirt_auth }}"
+        pattern: "name={{ olvm.datacenter }}"
+      register: info_dc
+      tags: [verificar]
+
+    - name: "Estado del storage domain dentro del Data Center"
+      ansible.builtin.uri:
+        url: "https://{{ olvm_host_api }}/ovirt-engine/api/datacenters/{{ info_dc.ovirt_datacenters[0].id }}/storagedomains"
+        user: "admin@internal"
+        password: "{{ olvm.admin_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ olvm.dns_local }}"
+        # El módulo uri valida contra el almacén del sistema, que no conoce la
+        # CA interna del engine: hay que indicársela explícitamente.
+        ca_path: "{{ olvm_ca_api }}"
+        headers:
+          Accept: application/json
+      register: info_sd
+      no_log: true
+      tags: [verificar]
+
+    - name: "VMs del aula"
+      ovirt.ovirt.ovirt_vm_info:
+        auth: "{{ ovirt_auth }}"
+        pattern: "name={{ olvm.aula.prefijo_vm }}{{ olvm.alumnos.prefijo }}*"
+      register: info_vms
+      tags: [verificar]
+
+    - name: "Los dos hosts KVM están Up"
+      ansible.builtin.assert:
+        that:
+          - info_hosts.ovirt_hosts | length == 2
+          - info_hosts.ovirt_hosts | selectattr('status', 'equalto', 'up') | list | length == 2
+        fail_msg: >-
+          Hosts en el clúster: {{ info_hosts.ovirt_hosts | map(attribute='name') | list }}
+          con estados {{ info_hosts.ovirt_hosts | map(attribute='status') | list }}
+        success_msg: "Los 2 hosts KVM están Up"
+      tags: [verificar]
+
+    # Con set_fact y no con vars: vars templatea a cadena y Ansible 2.20
+    # rechaza condicionales derivadas de texto.
+    - name: "Localizar el storage domain en la respuesta"
+      ansible.builtin.set_fact:
+        dominio: "{{ info_sd.json.storage_domain | selectattr('name', 'equalto', olvm.storage_domain) | list | first | default({}) }}"
+      tags: [verificar]
+
+    - name: "El storage domain está activo y es el maestro"
+      ansible.builtin.assert:
+        that:
+          - dominio.status | default('') == 'active'
+          - dominio.master | default(false) | bool
+        fail_msg: "El dominio {{ olvm.storage_domain }} no está activo en el DC {{ olvm.datacenter }}"
+        success_msg: >-
+          Storage domain {{ olvm.storage_domain }} activo,
+          {{ (dominio.available | default(0) | int) // 2**30 }} GB libres
+      tags: [verificar]
+
+    - name: "Hay una VM por alumno"
+      ansible.builtin.assert:
+        that: info_vms.ovirt_vms | length == olvm.alumnos.cantidad | int
+        fail_msg: >-
+          {{ info_vms.ovirt_vms | length }} VMs de alumno,
+          se esperaban {{ olvm.alumnos.cantidad }}
+        success_msg: "{{ info_vms.ovirt_vms | length }} VMs de alumno creadas"
+      tags: [verificar]
+
+    - name: "Resumen del laboratorio"
+      ansible.builtin.debug:
+        msg:
+          - "UI:        https://{{ olvm.vms[0].fqdn }}/ovirt-engine/"
+          - "Admin:     admin@internal"
+          - "Hosts:     {{ info_hosts.ovirt_hosts | map(attribute='name') | join(', ') }}"
+          - "Aula:      {{ olvm.alumnos.cantidad }} VMs ({{ olvm.aula.prefijo_vm }}{{ olvm.alumnos.prefijo }}1..{{ olvm.alumnos.cantidad }})"
+          - "Alumnos:   {{ olvm.alumnos.prefijo }}1..{{ olvm.alumnos.cantidad }} con UserVmManager sobre su VM"
+          - "Plantillas: {{ olvm.plantillas | map(attribute='nombre') | join(', ') }}"
+          - "Aula usa:  {{ olvm.plantilla_alumnos }}"
+      tags: [verificar]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 3.47 — PLANTILLA DEL AULA, CON EL USUARIO YA DENTRO
+# ═══════════════════════════════════════════════════════════════════════════
+# Las imágenes de nube vienen SIN usuario y SIN contraseña: los crea cloud-init
+# en el primer arranque. Y OLVM sólo monta el ConfigDrive cuando la VM se
+# arranca con "Ejecutar una vez"; si un alumno le da a "Ejecutar" a secas, la
+# máquina arranca sin nadie con quien entrar, ni siquiera por consola.
+#
+# Aquí se arranca UNA vez pidiendo cloud-init para que cree el usuario e
+# instale el agente, se limpia lo que identifica a esa máquina concreta, y se
+# convierte en plantilla. Desde ese momento el usuario viene de fábrica.
+#
+# OJO CON EL SELLADO: el "sellar" de OLVM es virt-sysprep, y entre sus
+# operaciones por defecto BORRA LAS CUENTAS DE USUARIO y /etc/sudoers.d. Es
+# decir, deshace justo lo que queremos conservar. Comprobado: tras sellar, en
+# /etc/passwd sólo quedaba root. Por eso aquí NO se sella y se limpia a mano.
+#
+# Lo que hay que limpiar y por qué:
+#   machine-id      -> systemd lo usa como identidad; NetworkManager lo deriva
+#                      para el DUID de DHCP. Si las diez VMs lo comparten,
+#                      piden el mismo arrendamiento y se pisan la IP.
+#   claves de host  -> si no, las diez VMs presentan la misma huella SSH.
+#   estado de cloud-init -> para que pueda volver a ejecutarse si alguien
+#                      arranca con "Ejecutar una vez" (que es materia de examen).
+#   hostname y arrendamientos -> para que cada clon nazca con lo suyo.
+- name: "OLVM — plantilla del aula: crear el molde"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tags: [plantilla-aula]
+
+  vars:
+    olvm_host_api: "{{ olvm.dns_local | ternary(olvm.vms[0].fqdn, olvm.vms[0].ip) }}"
+    olvm_ca_api: "{{ olvm.publicacion.ca_publica
+                    if (olvm.publicacion.habilitar | default(false) | bool)
+                    else (olvm.dns_local | ternary('/tmp/olvm-ca.pem', omit)) }}"
+    pa: "{{ olvm.plantilla_aula_lista }}"
+
+  tasks:
+    - name: "Autenticarse contra el engine"
+      ovirt.ovirt.ovirt_auth:
+        url: "https://{{ olvm_host_api }}/ovirt-engine/api"
+        username: "admin@internal"
+        password: "{{ olvm.admin_password }}"
+        ca_file: "{{ olvm_ca_api }}"
+        insecure: "{{ not (olvm.dns_local or olvm.publicacion.habilitar | default(false) | bool) }}"
+      when: pa.habilitar | bool
+
+    - name: "¿Existe ya la plantilla?"
+      ovirt.ovirt.ovirt_template_info:
+        auth: "{{ ovirt_auth }}"
+        pattern: "name={{ pa.nombre }}"
+      register: pa_existe
+      when: pa.habilitar | bool
+
+    - name: "Hay que construirla?"
+      ansible.builtin.set_fact:
+        pa_construir: "{{ (pa.habilitar | bool) and (pa_existe.ovirt_templates | default([]) | length == 0) }}"
+
+    - name: "Nada que hacer"
+      ansible.builtin.debug:
+        msg: "La plantilla {{ pa.nombre }} ya existe."
+      when: not pa_construir
+
+    # La clave pública del controlador entra por cloud-init sólo para poder
+    # hacer la limpieza desde aquí; la última tarea de la limpieza la borra,
+    # así que NO queda dentro de la plantilla.
+    - name: "Clave pública del controlador"
+      ansible.builtin.command:
+        cmd: "ssh-keygen -y -f {{ pa.clave_privada | default('~/.ssh/id_rsa') | expanduser }}"
+      register: pa_clave
+      changed_when: false
+      when: pa_construir
+
+    # Sin cloud_init_persist a propósito: con persist el módulo NO manda
+    # use_cloud_init al arrancar, y sin eso OLVM no fabrica el ConfigDrive.
+    - name: "VM molde desde {{ pa.origen }}, arrancada pidiendo cloud-init"
+      ovirt.ovirt.ovirt_vm:
+        auth: "{{ ovirt_auth }}"
+        name: "{{ pa.nombre }}-base"
+        template: "{{ pa.origen }}"
+        cluster: "{{ olvm.cluster }}"
+        memory: "{{ pa.memoria_mb }}MiB"
+        memory_guaranteed: "{{ pa.memoria_mb }}MiB"
+        cpu_cores: "{{ pa.vcpus }}"
+        operating_system: "{{ pa.so }}"
+        type: server
+        nics:
+          - name: nic1
+            profile_name: "{{ olvm.red.red_alumnos }}"
+        cloud_init:
+          host_name: "{{ pa.nombre }}-base"
+          user_name: "alumno"
+          root_password: "{{ olvm.password_invitado }}"
+          authorized_ssh_keys: "{{ pa_clave.stdout }}"
+          custom_script: |
+            ssh_pwauth: true
+            chpasswd:
+              expire: false
+              list: |
+                root:{{ olvm.password_invitado }}
+                alumno:{{ olvm.password_invitado }}
+            packages:
+              - qemu-guest-agent
+            runcmd:
+              - [ systemctl, enable, --now, qemu-guest-agent ]
+        state: running
+        wait: true
+        timeout: 900
+      when: pa_construir
+
+    # El agente lo instala cloud-init en su runcmd, de lo último que hace. Si
+    # el engine ve el SO reportado, cloud-init ha terminado.
+    - name: "Esperar a que cloud-init acabe (el agente reporta el SO)"
+      ovirt.ovirt.ovirt_vm_info:
+        auth: "{{ ovirt_auth }}"
+        pattern: "name={{ pa.nombre }}-base"
+      register: pa_vm
+      until: >-
+        pa_vm.ovirt_vms | length > 0 and
+        pa_vm.ovirt_vms[0].guest_operating_system is defined and
+        (pa_vm.ovirt_vms[0].guest_operating_system.distribution | default('')) != ''
+      retries: 60
+      delay: 10
+      when: pa_construir
+
+    - name: "Averiguar su IP"
+      ansible.builtin.uri:
+        url: "https://{{ olvm_host_api }}/ovirt-engine/api/vms/{{ pa_vm.ovirt_vms[0].id }}/reporteddevices"
+        headers:
+          Authorization: "Bearer {{ ovirt_auth.token }}"
+          Accept: application/json
+        ca_path: "{{ olvm_ca_api }}"
+      register: pa_dev
+      until: >-
+        (pa_dev.json.reported_device | default([])
+         | map(attribute='ips') | map(attribute='ip') | flatten
+         | selectattr('version','equalto','v4') | list | length) > 0
+      retries: 30
+      delay: 10
+      when: pa_construir
+
+    - name: "Registrar el molde para poder limpiarlo por SSH"
+      ansible.builtin.add_host:
+        name: "molde-aula"
+        groups: molde_aula
+        ansible_host: >-
+          {{ (pa_dev.json.reported_device | map(attribute='ips') | map(attribute='ip') | flatten
+              | selectattr('version','equalto','v4') | map(attribute='address') | first) }}
+        ansible_user: alumno
+        ansible_connection: ssh
+        ansible_ssh_private_key_file: "{{ pa.clave_privada | default('~/.ssh/id_rsa') }}"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+      changed_when: false
+      when: pa_construir
+
+- name: "OLVM — plantilla del aula: quitarle la identidad al molde"
+  hosts: molde_aula
+  gather_facts: false
+  become: true
+  tags: [plantilla-aula]
+
+  tasks:
+    - name: "Borrar el estado de cloud-init (pero dejarlo utilizable)"
+      ansible.builtin.command:
+        cmd: cloud-init clean --logs --seed
+      changed_when: true
+
+    - name: "Borrar lo que identifica a ESTA máquina"
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          rm -f /etc/ssh/ssh_host_*
+          : > /etc/machine-id
+          rm -f /var/lib/dbus/machine-id
+          rm -f /etc/hostname
+          rm -rf /var/lib/NetworkManager/*
+          rm -rf /var/lib/dhclient/* /var/lib/dhcp/*
+          rm -rf /var/log/journal/*
+          rm -f /var/log/messages /var/log/secure
+          rm -rf /root/.ssh
+          rm -f /root/.bash_history /home/alumno/.bash_history
+          exit 0
+      changed_when: true
+
+    - name: "Comprobar que el usuario sigue ahí y con sudo"
+      ansible.builtin.shell:
+        cmd: "getent passwd alumno && ls /etc/sudoers.d/"
+      register: molde_user
+      changed_when: false
+
+    - name: "Resultado"
+      ansible.builtin.debug:
+        msg: "{{ molde_user.stdout_lines }}"
+
+    # Última tarea: a partir de aquí ya no se puede volver a entrar con clave.
+    - name: "Quitar la clave del controlador"
+      ansible.builtin.file:
+        path: /home/alumno/.ssh
+        state: absent
+
+- name: "OLVM — plantilla del aula: convertir el molde en plantilla"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tags: [plantilla-aula]
+
+  vars:
+    pa: "{{ olvm.plantilla_aula_lista }}"
+
+  tasks:
+    - name: "Apagar el molde"
+      ovirt.ovirt.ovirt_vm:
+        auth: "{{ ovirt_auth }}"
+        name: "{{ pa.nombre }}-base"
+        state: stopped
+        wait: true
+        timeout: 600
+      when: pa_construir
+
+    # SIN seal: virt-sysprep borraría la cuenta que acabamos de crear.
+    - name: "Crear la plantilla {{ pa.nombre }}"
+      ovirt.ovirt.ovirt_template:
+        auth: "{{ ovirt_auth }}"
+        name: "{{ pa.nombre }}"
+        vm: "{{ pa.nombre }}-base"
+        cluster: "{{ olvm.cluster }}"
+        description: "{{ pa.nota }}"
+        seal: false
+        state: present
+        wait: true
+        timeout: 3600
+      when: pa_construir
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 3.48 — LAS VMs DEL AULA SOBRE LA PLANTILLA PERSONALIZADA
+# ═══════════════════════════════════════════════════════════════════════════
+# Una por alumno, desde alma9-aula. Se arrancan UNA vez pidiendo cloud-init
+# para que cada una se ponga su propio hostname —la plantilla no lo trae, se
+# le quitó a propósito para que no salieran diez máquinas llamándose igual— y
+# después se apagan. A partir de ahí el alumno le da a "Ejecutar" y entra.
+#
+# No se les asignan permisos: los alumnos son SuperUser sobre el sistema, así
+# que ya pueden con todo. Si algún día se les recorta el rol, habrá que darles
+# UserVmManager sobre la suya, como se hace con las vm-alumnoN.
+- name: "OLVM — VMs de aula sobre {{ olvm.plantilla_aula_lista.nombre }}"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tags: [aula-alma]
+
+  vars:
+    olvm_host_api: "{{ olvm.dns_local | ternary(olvm.vms[0].fqdn, olvm.vms[0].ip) }}"
+    olvm_ca_api: "{{ olvm.publicacion.ca_publica
+                    if (olvm.publicacion.habilitar | default(false) | bool)
+                    else (olvm.dns_local | ternary('/tmp/olvm-ca.pem', omit)) }}"
+    pa: "{{ olvm.plantilla_aula_lista }}"
+    nombres: >-
+      {{ range(1, olvm.alumnos.cantidad + 1)
+         | map('regex_replace', '^(.*)$', pa.prefijo_vm ~ olvm.alumnos.prefijo ~ '\1')
+         | list }}
+
+  tasks:
+    - name: "Autenticarse contra el engine"
+      ovirt.ovirt.ovirt_auth:
+        url: "https://{{ olvm_host_api }}/ovirt-engine/api"
+        username: "admin@internal"
+        password: "{{ olvm.admin_password }}"
+        ca_file: "{{ olvm_ca_api }}"
+        insecure: "{{ not (olvm.dns_local or olvm.publicacion.habilitar | default(false) | bool) }}"
+      when: pa.crear_vms | default(false) | bool
+
+    - name: "Cuáles existen ya"
+      ovirt.ovirt.ovirt_vm_info:
+        auth: "{{ ovirt_auth }}"
+        pattern: "name={{ pa.prefijo_vm }}*"
+      register: aula_existentes
+      when: pa.crear_vms | default(false) | bool
+
+    - name: "Crear y arrancar pidiendo cloud-init, para que fijen su hostname"
+      ovirt.ovirt.ovirt_vm:
+        auth: "{{ ovirt_auth }}"
+        name: "{{ item }}"
+        template: "{{ pa.nombre }}"
+        cluster: "{{ olvm.cluster }}"
+        memory: "{{ pa.memoria_mb }}MiB"
+        memory_guaranteed: "{{ pa.memoria_mb }}MiB"
+        cpu_cores: "{{ pa.vcpus }}"
+        operating_system: "{{ pa.so }}"
+        type: server
+        nics:
+          - name: nic1
+            profile_name: "{{ olvm.red.red_alumnos }}"
+        cloud_init:
+          host_name: "{{ item }}"
+        state: running
+        wait: true
+        timeout: 900
+      loop: "{{ nombres }}"
+      when:
+        - pa.crear_vms | default(false) | bool
+        - item not in (aula_existentes.ovirt_vms | default([]) | map(attribute='name') | list)
+
+    - name: "Esperar a que todas terminen su primer arranque"
+      ovirt.ovirt.ovirt_vm_info:
+        auth: "{{ ovirt_auth }}"
+        pattern: "name={{ pa.prefijo_vm }}*"
+      register: aula_vms
+      until: >-
+        (aula_vms.ovirt_vms | default([]) | length) == (nombres | length) and
+        (aula_vms.ovirt_vms
+          | selectattr('guest_operating_system','defined')
+          | map(attribute='guest_operating_system.distribution')
+          | select('ne','') | list | length) == (nombres | length)
+      retries: 90
+      delay: 10
+      when: pa.crear_vms | default(false) | bool
+
+    - name: "Apagarlas: quedan listas para que las arranque cada alumno"
+      ovirt.ovirt.ovirt_vm:
+        auth: "{{ ovirt_auth }}"
+        name: "{{ item }}"
+        state: stopped
+        wait: true
+        timeout: 600
+      loop: "{{ nombres }}"
+      when: pa.crear_vms | default(false) | bool
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 3.49 — IMÁGENES SUELTAS (disco subido, sin plantilla)
+# ═══════════════════════════════════════════════════════════════════════════
+# Deliberadamente se queda a medias: sube el disco y para. El recorrido que
+# falta —crear la VM, personalizarla con cloud-init y sellarla como plantilla—
+# es la práctica que tienen que hacer los alumnos.
+#
+# La subida se delega al host KVM, que es quien tiene qemu-img y el SDK, y usa
+# el bundle de CAs: el módulo valida con UNA sola ca_file dos extremos con CAs
+# distintas, la API y imageio.
+- name: "OLVM — subir imágenes sueltas para las prácticas"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tags: [imagen-suelta]
+
+  vars:
+    olvm_host_api: "{{ olvm.dns_local | ternary(olvm.vms[0].fqdn, olvm.vms[0].ip) }}"
+    olvm_ca_api: "{{ olvm.publicacion.ca_publica
+                    if (olvm.publicacion.habilitar | default(false) | bool)
+                    else (olvm.dns_local | ternary('/tmp/olvm-ca.pem', omit)) }}"
+    olvm_uploader: "{{ (olvm.vms | selectattr('rol', 'equalto', 'host') | first).nombre }}"
+
+  tasks:
+    - name: "Autenticarse contra el engine"
+      ovirt.ovirt.ovirt_auth:
+        url: "https://{{ olvm_host_api }}/ovirt-engine/api"
+        username: "admin@internal"
+        password: "{{ olvm.admin_password }}"
+        ca_file: "{{ olvm_ca_api }}"
+        insecure: "{{ not (olvm.dns_local or olvm.publicacion.habilitar | default(false) | bool) }}"
+
+    - name: "Discos que ya existen"
+      ovirt.ovirt.ovirt_disk_info:
+        auth: "{{ ovirt_auth }}"
+        pattern: "name=*"
+      register: discos_ya
+
+    - name: "Descargar las que falten en el host que sube"
+      ansible.builtin.get_url:
+        url: "{{ item.url }}"
+        dest: "/var/tmp/suelta-{{ item.nombre }}.qcow2"
+        checksum: "{{ item.checksum }}"
+        mode: "0644"
+        timeout: 300
+      loop: "{{ olvm.imagenes_sueltas | default([]) }}"
+      loop_control:
+        label: "{{ item.nombre }}"
+      when: item.nombre not in (discos_ya.ovirt_disks | map(attribute='name') | list)
+      delegate_to: "{{ olvm_uploader }}"
+      become: true
+
+    - name: "Subirlas como disco de datos arrancable"
+      ovirt.ovirt.ovirt_disk:
+        auth: "{{ ovirt_auth | combine({'ca_file': '/var/tmp/olvm-ca.pem'}) if olvm.dns_local | bool else ovirt_auth }}"
+        name: "{{ item.nombre }}"
+        description: "{{ item.nota }}"
+        upload_image_path: "/var/tmp/suelta-{{ item.nombre }}.qcow2"
+        storage_domain: "{{ olvm.storage_domain }}"
+        format: cow
+        bootable: true
+        wait: true
+        timeout: 3600
+      loop: "{{ olvm.imagenes_sueltas | default([]) }}"
+      loop_control:
+        label: "{{ item.nombre }}"
+      when: item.nombre not in (discos_ya.ovirt_disks | map(attribute='name') | list)
+      delegate_to: "{{ olvm_uploader }}"
+      become: true
+
+    - name: "Borrar la descarga del host"
+      ansible.builtin.file:
+        path: "/var/tmp/suelta-{{ item.nombre }}.qcow2"
+        state: absent
+      loop: "{{ olvm.imagenes_sueltas | default([]) }}"
+      loop_control:
+        label: "{{ item.nombre }}"
+      delegate_to: "{{ olvm_uploader }}"
+      become: true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 3.50 — UNA COPIA DE LA IMAGEN SUELTA POR ALUMNO
+# ═══════════════════════════════════════════════════════════════════════════
+# Un disco suelto sólo se puede adjuntar a una VM a la vez, y no admite clones
+# finos: el backing file compartido sólo lo dan las plantillas. Así que para
+# que los diez trabajen en paralelo desde la imagen cruda, cada uno necesita
+# su copia completa. Salen a 1,2 GiB, sobre 2,7 TB libres.
+- name: "OLVM — una copia de cada imagen suelta por alumno"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tags: [copias-alumno]
+
+  vars:
+    olvm_host_api: "{{ olvm.dns_local | ternary(olvm.vms[0].fqdn, olvm.vms[0].ip) }}"
+    olvm_ca_api: "{{ olvm.publicacion.ca_publica
+                    if (olvm.publicacion.habilitar | default(false) | bool)
+                    else (olvm.dns_local | ternary('/tmp/olvm-ca.pem', omit)) }}"
+
+  tasks:
+    - name: "Autenticarse contra el engine"
+      ovirt.ovirt.ovirt_auth:
+        url: "https://{{ olvm_host_api }}/ovirt-engine/api"
+        username: "admin@internal"
+        password: "{{ olvm.admin_password }}"
+        ca_file: "{{ olvm_ca_api }}"
+        insecure: "{{ not (olvm.dns_local or olvm.publicacion.habilitar | default(false) | bool) }}"
+
+    - name: "Discos actuales"
+      ovirt.ovirt.ovirt_disk_info:
+        auth: "{{ ovirt_auth }}"
+        pattern: "name=*"
+      register: discos_hoy
+
+    - name: "Construir la lista de copias a crear"
+      ansible.builtin.set_fact:
+        trabajo: >-
+          {{ trabajo | default([]) + [{
+               'base': base.nombre,
+               'base_id': (discos_hoy.ovirt_disks | selectattr('name','equalto', base.nombre) | map(attribute='id') | first),
+               'alias': base.copias.prefijo ~ n,
+               'nota': base.nota
+             }] }}
+      loop: "{{ olvm.imagenes_sueltas | default([]) | selectattr('copias','defined') | selectattr('copias.habilitar') | list
+                | product(range(1, olvm.alumnos.cantidad + 1)) | list }}"
+      loop_control:
+        label: "{{ item.0.copias.prefijo }}{{ item.1 }}"
+      vars:
+        base: "{{ item.0 }}"
+        n: "{{ item.1 }}"
+
+    - name: "Copiar las que no existan"
+      ansible.builtin.uri:
+        url: "https://{{ olvm_host_api }}/ovirt-engine/api/disks/{{ item.base_id }}/copy"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ ovirt_auth.token }}"
+          Accept: application/json
+        body_format: json
+        body:
+          disk:
+            alias: "{{ item.alias }}"
+            description: "{{ item.nota }}"
+          storage_domain:
+            name: "{{ olvm.storage_domain }}"
+        ca_path: "{{ olvm_ca_api }}"
+        # El engine no admite dos copias simultaneas del mismo disco origen:
+        # responde 409 "is being moved or copied". En vez de fallar, se acepta
+        # ese 409 y se reintenta hasta que la anterior termina, con lo que las
+        # copias salen en fila de una en una.
+        status_code: [200, 202, 409]
+      register: copia
+      until: copia.status in [200, 202]
+      retries: 60
+      delay: 15
+      loop: "{{ trabajo | default([]) }}"
+      loop_control:
+        label: "{{ item.alias }}"
+      when: item.alias not in (discos_hoy.ovirt_disks | map(attribute='name') | list)
+
+    - name: "Esperar a que terminen de copiarse"
+      ovirt.ovirt.ovirt_disk_info:
+        auth: "{{ ovirt_auth }}"
+        pattern: "name=*"
+      register: copias_estado
+      until: >-
+        (copias_estado.ovirt_disks
+          | selectattr('name','match','^' ~ (olvm.imagenes_sueltas | selectattr('copias','defined') | first).copias.prefijo)
+          | selectattr('status','equalto','locked') | list | length) == 0
+        and
+        (copias_estado.ovirt_disks
+          | selectattr('name','match','^' ~ (olvm.imagenes_sueltas | selectattr('copias','defined') | first).copias.prefijo)
+          | list | length) == olvm.alumnos.cantidad
+      retries: 120
+      delay: 15

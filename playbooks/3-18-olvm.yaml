@@ -1,0 +1,929 @@
+# Laboratorio OLVM (Oracle Linux Virtualization Manager 4.5) para el curso
+#
+# Las TRES VMs del laboratorio corren con libvirt sobre el SO de los nodos,
+# FUERA de Kubernetes, en paralelo a los pods. No hay ninguna pieza bare metal.
+#
+#   - export NFS del storage domain en maestro
+#   - reserva de RAM en kubelet (worker2, worker3, worker4) para que el
+#     scheduler no invada la memoria de las VMs
+#   - libvirt en esos tres nodos, con la red default DESACTIVADA (virbr0 mete
+#     reglas de NAT en iptables que se pelean con Calico/kube-proxy)
+#   - VM olvm-engine (OL 8.10)          en worker2
+#   - VM olvm-host1  (OL 9.8, anidada)  en worker3
+#   - VM olvm-host2  (OL 9.8, anidada)  en worker4  (9 GB: es el nodo más justo)
+#
+# maestro y worker1 NO se tocan: maestro está al 74% de RAM reservada y es el
+# servidor NFS; worker1 es el nodo que se congelaba.
+#
+# Las VMs de los alumnos son L2 (anidadas). Estos Ivy Bridge no tienen VMCS
+# shadowing, así que arrancan lentas: hay que ensayar los tiempos, no
+# descubrirlos en clase. Ver el dimensionado al final del fichero.
+#
+# Tags:  preflight | nfs | reserva | libvirt | imagenes | vms | verificar
+#
+#   ansible-navigator run playbooks/3-extras/3-18-olvm.yaml -e @parametros/desa.yaml
+#
+# Para deshacerlo todo:  --tags destruir
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 1 — PREFLIGHT
+# ═══════════════════════════════════════════════════════════════════════════
+- name: "OLVM — comprobaciones previas en los nodos anfitriones"
+  hosts: worker2:worker3:worker4
+  gather_facts: true
+  become: false
+  tags: [preflight]
+
+  tasks:
+    - name: "Localizar la VM que le toca a este nodo"
+      ansible.builtin.set_fact:
+        vm: "{{ olvm.vms | selectattr('nodo', 'equalto', inventory_hostname) | first }}"
+
+    - name: "Comprobar que existe /dev/kvm"
+      ansible.builtin.stat:
+        path: /dev/kvm
+      register: devkvm
+      failed_when: not devkvm.stat.exists
+
+    - name: "Comprobar que la virtualización anidada está activa"
+      ansible.builtin.slurp:
+        src: /sys/module/kvm_intel/parameters/nested
+      register: nested
+
+    - name: "Fallar si el anidamiento está desactivado"
+      ansible.builtin.assert:
+        that: (nested.content | b64decode | trim) in ['Y', '1']
+        fail_msg: >-
+          kvm_intel nested={{ nested.content | b64decode | trim }}. Sin anidamiento
+          los hosts KVM no pueden aceptar VMs de alumno. Activar con:
+          echo 'options kvm_intel nested=1' > /etc/modprobe.d/kvm.conf && reiniciar.
+
+    # Si el laboratorio ya está montado, la RAM está ocupada por la propia VM
+    # y su IP responde: esas dos comprobaciones sólo tienen sentido antes de
+    # crearla. Sin esto, preflight deja de ser re-ejecutable.
+    - name: "¿Existe ya la VM en este nodo?"
+      ansible.builtin.command: "virsh dominfo {{ vm.nombre }}"
+      register: vm_existe
+      changed_when: false
+      failed_when: false
+      become: true
+
+    - name: "Aviso: la VM ya existe, se omiten las comprobaciones de RAM e IP"
+      ansible.builtin.debug:
+        msg: "{{ vm.nombre }} ya existe en {{ inventory_hostname }}"
+      when: vm_existe.rc == 0
+
+    - name: "Comprobar RAM libre suficiente para la VM"
+      when: vm_existe.rc != 0
+      ansible.builtin.assert:
+        that: ansible_memory_mb.nocache.free > (vm.memoria_mb + 1536)
+        fail_msg: >-
+          {{ inventory_hostname }} tiene {{ ansible_memory_mb.nocache.free }} MB libres
+          y {{ vm.nombre }} pide {{ vm.memoria_mb }} MB + ~1,5 GB de overhead de QEMU.
+          Apaga OpenStack/Ceph o baja olvm.vms[].memoria_mb en desa.yaml.
+        success_msg: "{{ ansible_memory_mb.nocache.free }} MB libres para {{ vm.nombre }} ({{ vm.memoria_mb }} MB)"
+
+    - name: "Comprobar que la IP de la VM está libre"
+      ansible.builtin.command: "ping -c1 -W1 {{ vm.ip }}"
+      register: ping_ip
+      changed_when: false
+      failed_when: ping_ip.rc == 0
+      when: vm_existe.rc != 0
+
+    - name: "Comprobar que existe la NIC sobre la que se hará macvtap"
+      ansible.builtin.assert:
+        that: olvm.red.nic_nodo in ansible_interfaces
+        fail_msg: "No existe {{ olvm.red.nic_nodo }} en {{ inventory_hostname }}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 2 — STORAGE DOMAIN NFS (en maestro)
+# ═══════════════════════════════════════════════════════════════════════════
+- name: "OLVM — export NFS para el storage domain"
+  hosts: maestro
+  gather_facts: false
+  become: true
+  tags: [nfs]
+
+  tasks:
+    - name: "Crear el directorio del storage domain con ownership 36:36 (vdsm:kvm)"
+      ansible.builtin.file:
+        path: "{{ olvm.nfs.ruta }}"
+        state: directory
+        owner: "{{ olvm.nfs.uid }}"
+        group: "{{ olvm.nfs.gid }}"
+        mode: "0755"
+
+    # maestro tiene manage-gids=y en /etc/nfs.conf (por defecto en Ubuntu):
+    # rpc.mountd IGNORA la lista de grupos que manda el cliente y resuelve los
+    # del uid contra /etc/passwd DEL SERVIDOR. En el host de OLVM acceden al
+    # storage tres uids distintos —vdsm(36), sanlock(179) y qemu(107)— que
+    # sólo llegan a los ficheros 0660 de vdsm:kvm por pertenecer al grupo kvm.
+    # Como maestro no conoce esos uids, no les ve ningún grupo y devuelve
+    # EACCES: el storage domain falla con "Could not initialize cluster lock"
+    # y las VMs con "Could not open ...: Permission denied".
+    #
+    # Crear esos usuarios en maestro NO sirve: el uid 107 ya lo ocupa
+    # 'landscape' en Ubuntu. Y desactivar manage-gids cambiaría la semántica
+    # de permisos de TODO el servidor NFS, que también sirve los PV de
+    # Kubernetes.
+    #
+    # La solución acotada es mapear todos los accesos de ESTE export a
+    # vdsm:kvm con all_squash + anonuid/anongid. Misma técnica que ya usa el
+    # export de openclaw. Sólo afecta a /datos/olvm.
+    - name: "Grupo kvm ({{ olvm.nfs.gid }}) en el servidor NFS"
+      # No hace falta para los permisos (los resuelve anonuid), pero deja
+      # legible el ls -l del storage domain en maestro.
+      ansible.builtin.group:
+        name: kvm
+        gid: "{{ olvm.nfs.gid }}"
+        system: true
+        state: present
+
+    - name: "Usuario vdsm ({{ olvm.nfs.uid }}) en el servidor NFS"
+      ansible.builtin.user:
+        name: vdsm
+        uid: "{{ olvm.nfs.uid }}"
+        group: kvm
+        system: true
+        shell: /sbin/nologin
+        create_home: false
+        state: present
+      register: usuario_vdsm
+
+    - name: "Crear el directorio del segundo storage domain"
+      ansible.builtin.file:
+        path: "{{ olvm.nfs.ruta_2 }}"
+        state: directory
+        owner: "{{ olvm.nfs.uid }}"
+        group: "{{ olvm.nfs.gid }}"
+        mode: "0755"
+
+    - name: "Publicar el export mapeando todo a vdsm:kvm"
+      ansible.builtin.lineinfile:
+        path: /etc/exports
+        regexp: "^{{ olvm.nfs.ruta }}\\s"
+        line: >-
+          {{ olvm.nfs.ruta }}
+          192.168.2.0/24(rw,sync,no_subtree_check,all_squash,anonuid={{ olvm.nfs.uid }},anongid={{ olvm.nfs.gid }})
+        create: true
+        mode: "0644"
+      register: export_nfs
+
+    - name: "Publicar el segundo export"
+      ansible.builtin.lineinfile:
+        path: /etc/exports
+        regexp: "^{{ olvm.nfs.ruta_2 }}\\s"
+        line: >-
+          {{ olvm.nfs.ruta_2 }}
+          192.168.2.0/24(rw,sync,no_subtree_check,all_squash,anonuid={{ olvm.nfs.uid }},anongid={{ olvm.nfs.gid }})
+        create: true
+        mode: "0644"
+      register: export_nfs2
+
+    - name: "Recargar exports y vaciar el cache de autenticación de mountd"
+      # exportfs -f vacía el cache de grupos de rpc.mountd: sin esto, el
+      # servidor sigue usando la resolución antigua del uid 179.
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - exportfs -ra
+        - exportfs -f
+      when: export_nfs.changed or export_nfs2.changed or usuario_vdsm.changed
+      changed_when: true
+
+    - name: "Verificación — el export es visible"
+      ansible.builtin.command: "showmount -e localhost"
+      register: showmount
+      changed_when: false
+      failed_when: olvm.nfs.ruta not in showmount.stdout or olvm.nfs.ruta_2 not in showmount.stdout
+
+    # Estas dos llevan tag [vms] además del [nfs] del play: al lanzar sólo
+    # --tags vms hacen falta igualmente para poder inyectar la clave.
+    - name: "Leer la clave pública que ya da acceso a los nodos"
+      ansible.builtin.slurp:
+        src: /home/ivan/.ssh/authorized_keys
+      register: authkeys
+      become: false
+      tags: [vms]
+
+    - name: "Guardarla para las VMs (cloud-init)"
+      ansible.builtin.set_fact:
+        olvm_ssh_key: "{{ (authkeys.content | b64decode).splitlines() | select('match', '^(ssh|ecdsa)-') | first }}"
+        cacheable: true
+      tags: [vms]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 3 — RESERVA DE RAM EN KUBELET
+# ═══════════════════════════════════════════════════════════════════════════
+# Sin esto, el scheduler ve la RAM de la VM como libre, mete pods encima, y
+# cuando la VM crece el OOM killer elige víctima. Bajamos el allocatable del
+# nodo para que Kubernetes ni se plantee usar esa memoria.
+- name: "OLVM — reservar la RAM de las VMs frente a kubelet"
+  hosts: worker2:worker3:worker4
+  gather_facts: false
+  become: true
+  # De uno en uno: reiniciar kubelet en los tres nodos a la vez abre una
+  # ventana en la que tres nodos pueden quedar NotReady simultáneamente y el
+  # node controller empezaría a desalojar pods.
+  serial: 1
+  tags: [reserva]
+
+  tasks:
+    - name: "Leer la configuración actual de kubelet"
+      ansible.builtin.slurp:
+        src: /var/lib/kubelet/config.yaml
+      register: kubelet_raw
+
+    - name: "Parsear y calcular la nueva configuración"
+      ansible.builtin.set_fact:
+        kubelet_cfg: "{{ kubelet_raw.content | b64decode | from_yaml }}"
+        reserva: "{{ olvm.reserva_kubelet[inventory_hostname] }}"
+
+    - name: "Copia de seguridad de la configuración de kubelet"
+      ansible.builtin.copy:
+        src: /var/lib/kubelet/config.yaml
+        dest: "/var/lib/kubelet/config.yaml.pre-olvm"
+        remote_src: true
+        force: false
+        mode: "0644"
+
+    - name: "Fijar systemReserved.memory = {{ olvm.reserva_kubelet[inventory_hostname] }}"
+      ansible.builtin.copy:
+        content: |
+          {{ kubelet_cfg | combine({'systemReserved': (kubelet_cfg.systemReserved | default({})) | combine({'memory': reserva})}, recursive=true) | to_nice_yaml(indent=2) }}
+        dest: /var/lib/kubelet/config.yaml
+        mode: "0644"
+      register: kubelet_cambio
+
+    - name: "Reiniciar kubelet"
+      ansible.builtin.systemd_service:
+        name: kubelet
+        state: restarted
+      when: kubelet_cambio.changed
+
+    - name: "Esperar a que el nodo vuelva a Ready"
+      ansible.builtin.command: >-
+        kubectl --kubeconfig=/etc/kubernetes/kubelet.conf get node {{ inventory_hostname }}
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: nodo_ready
+      until: nodo_ready.stdout == "True"
+      retries: 20
+      delay: 6
+      changed_when: false
+      when: kubelet_cambio.changed
+
+    - name: "Verificación — allocatable de memoria tras la reserva"
+      ansible.builtin.command: >-
+        kubectl --kubeconfig=/etc/kubernetes/kubelet.conf get node {{ inventory_hostname }}
+        -o jsonpath={.status.allocatable.memory}
+      register: allocatable
+      changed_when: false
+
+    - name: "Mostrar el allocatable resultante"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: allocatable.memory = {{ allocatable.stdout }} (reservados {{ reserva }})"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 4 — LIBVIRT EN LOS NODOS ANFITRIONES
+# ═══════════════════════════════════════════════════════════════════════════
+- name: "OLVM — libvirt en los nodos anfitriones"
+  hosts: worker2:worker3:worker4
+  gather_facts: false
+  become: true
+  # De uno en uno: instalar libvirt toca iptables, y si algo se pelea con
+  # Calico o kube-proxy queremos enterarnos en el primer nodo, no en los tres.
+  serial: 1
+  tags: [libvirt]
+
+  tasks:
+    - name: "Instalar QEMU/KVM, libvirt y utilidades de imagen cloud"
+      ansible.builtin.apt:
+        name:
+          - qemu-kvm
+          - libvirt-daemon-system
+          - libvirt-clients
+          - virtinst
+          - cloud-image-utils
+        state: present
+        update_cache: true
+      register: apt_libvirt
+
+    - name: "Arrancar libvirtd"
+      ansible.builtin.systemd_service:
+        name: libvirtd
+        state: started
+        enabled: true
+
+    # ─── CRÍTICO ────────────────────────────────────────────────────────────
+    # La red 'default' de libvirt crea virbr0 con su propio NAT en iptables.
+    # En un nodo de Kubernetes eso convive mal con Calico y kube-proxy. Como
+    # usamos macvtap, no la necesitamos para nada: fuera.
+    - name: "Parar la red default de libvirt (virbr0 y su NAT)"
+      ansible.builtin.command: "virsh net-destroy default"
+      register: net_destroy
+      changed_when: "'destroyed' in net_destroy.stdout"
+      failed_when:
+        - net_destroy.rc != 0
+        - "'is not active' not in net_destroy.stderr"
+        - "'not found' not in net_destroy.stderr"
+
+    # virsh imprime "unmarked as autostarted" aunque ya estuviera desactivada,
+    # así que hay que consultar el estado antes o la tarea sale changed en
+    # cada ejecución.
+    - name: "Consultar si la red default está marcada para autoarranque"
+      ansible.builtin.command: "virsh net-info default"
+      register: net_info
+      changed_when: false
+      failed_when: false
+
+    - name: "Impedir que la red default vuelva al arrancar"
+      ansible.builtin.command: "virsh net-autostart default --disable"
+      when: net_info.stdout is search('Autostart:\\s+yes')
+      changed_when: true
+
+    - name: "Verificación — virbr0 no existe"
+      ansible.builtin.command: "ip -br link show virbr0"
+      register: virbr0
+      changed_when: false
+      failed_when: virbr0.rc == 0
+
+    - name: "Verificación — kube-proxy y Calico siguen sanos tras instalar libvirt"
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        kubectl --kubeconfig=/etc/kubernetes/kubelet.conf get pods -A
+        --field-selector spec.nodeName={{ inventory_hostname }} --no-headers
+        | grep -E 'calico|kube-proxy' | grep -vc Running
+      args:
+        executable: /bin/bash
+      register: cni_ok
+      changed_when: false
+      failed_when: cni_ok.stdout | int > 0
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 4.5 — BRIDGE PARA LA RED DE LOS ALUMNOS
+# ═══════════════════════════════════════════════════════════════════════════
+# Sólo en los nodos que hospedan un host KVM. Convierte la segunda NIC (USB,
+# sin usar por Kubernetes) en un bridge, para que las VMs anidadas de los
+# alumnos puedan salir a la LAN con su propia MAC. Ver el porqué en el
+# bloque olvm.red de desa.yaml.
+# MetalLB en modo L2 elige por su cuenta la interfaz por la que responde ARP.
+# Al aparecer br-olvm se mudó a él —que no tiene IP— y dejó inalcanzables
+# TODOS los ingress del clúster. Hay que fijarle la NIC primaria ANTES de
+# crear el bridge.
+- name: "OLVM — fijar MetalLB a la NIC primaria antes de tocar la red"
+  hosts: maestro
+  gather_facts: false
+  become: true
+  tags: [red-alumnos]
+
+  tasks:
+    - name: "Restringir los L2Advertisement a {{ olvm.red.nic_nodo }}"
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: patched
+        api_version: metallb.io/v1beta1
+        kind: L2Advertisement
+        namespace: metallb-system
+        name: "{{ item }}"
+        definition:
+          spec:
+            interfaces: ["{{ olvm.red.nic_nodo }}"]
+      loop: [l2-internal, l2-public]
+
+    - name: "Verificación — los ingress vuelven a responder"
+      ansible.builtin.uri:
+        url: "https://{{ item }}/"
+        validate_certs: false
+        status_code: [200, 301, 302, 401, 403, 404]
+        timeout: 15
+      register: ing
+      until: ing is succeeded
+      retries: 10
+      delay: 6
+      loop:
+        - grafana.ivanosuna.com
+        - cluster.ivanosuna.com
+      delegate_to: localhost
+      become: false
+
+- name: "OLVM — bridge para la red de los alumnos"
+  hosts: worker3:worker4
+  gather_facts: false
+  become: true
+  # De uno en uno: se aplica configuración de red en un nodo del clúster.
+  serial: 1
+  tags: [red-alumnos]
+
+  tasks:
+    - name: "Comprobar que la NIC secundaria existe y tiene enlace"
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        cat /sys/class/net/{{ olvm.red.nic_alumnos[inventory_hostname] }}/carrier
+      args:
+        executable: /bin/bash
+      register: carrier
+      changed_when: false
+      failed_when: carrier.stdout | trim != '1'
+
+    - name: "Definir el bridge en netplan"
+      ansible.builtin.copy:
+        dest: /etc/netplan/61-olvm-bridge.yaml
+        mode: "0600"
+        content: |
+          # Bridge para las VMs de los alumnos de OLVM.
+          # Lo genera playbooks/3-extras/3-18-olvm.yaml.
+          # NO lleva IP: es puramente L2, sólo transporta el tráfico de las
+          # VMs anidadas hacia la LAN.
+          network:
+            version: 2
+            bridges:
+              {{ olvm.red.bridge_alumnos }}:
+                interfaces: [{{ olvm.red.nic_alumnos[inventory_hostname] }}]
+                dhcp4: false
+                dhcp6: false
+                optional: true
+                parameters:
+                  stp: false
+                  forward-delay: 0
+      register: netplan_bridge
+
+    # ¡NO usar "netplan apply"! En estos nodos VACÍA las rutas del overlay
+    # que instala Calico (las 10.10.x.x/26 vía vxlan.calico) y el nodo pierde
+    # DNS y conectividad entre pods hasta que se reinicia calico-node.
+    # Comprobado. El fichero de netplan queda sólo para que el bridge
+    # persista tras un reinicio, donde Calico arranca de cero igualmente; el
+    # bridge de AHORA se crea a mano, sin tocar el resto de la red.
+    - name: "¿Existe ya el bridge?"
+      ansible.builtin.command: "ip -br link show {{ olvm.red.bridge_alumnos }}"
+      register: br_existe
+      changed_when: false
+      failed_when: false
+
+    - name: "Crear el bridge en caliente"
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - "ip link add name {{ olvm.red.bridge_alumnos }} type bridge"
+        - "ip link set {{ olvm.red.bridge_alumnos }} type bridge stp_state 0 forward_delay 0"
+        - "ip link set {{ olvm.red.bridge_alumnos }} up"
+      when: br_existe.rc != 0
+      changed_when: true
+
+    - name: "¿Está la NIC ya esclavizada?"
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        ip -o link show {{ olvm.red.nic_alumnos[inventory_hostname] }}
+        | grep -c 'master {{ olvm.red.bridge_alumnos }}' || true
+      args:
+        executable: /bin/bash
+      register: ya_esclava
+      changed_when: false
+
+    - name: "Esclavizar la NIC secundaria al bridge"
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - "ip link set {{ olvm.red.nic_alumnos[inventory_hostname] }} master {{ olvm.red.bridge_alumnos }}"
+        - "ip link set {{ olvm.red.nic_alumnos[inventory_hostname] }} up"
+      when: ya_esclava.stdout | int != 1
+      changed_when: true
+
+    - name: "Verificación — la NIC está esclavizada al bridge"
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        ip -o link show {{ olvm.red.nic_alumnos[inventory_hostname] }}
+        | grep -c 'master {{ olvm.red.bridge_alumnos }}'
+      args:
+        executable: /bin/bash
+      register: esclava
+      changed_when: false
+      failed_when: esclava.stdout | int != 1
+
+    - name: "Verificación — el nodo sigue Ready y con su IP intacta"
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        ip -br addr show {{ olvm.red.nic_nodo }} | grep -c '192.168.2.'
+      args:
+        executable: /bin/bash
+      register: ip_nodo
+      changed_when: false
+      failed_when: ip_nodo.stdout | int != 1
+
+    - name: "Verificación — Calico y kube-proxy siguen sanos"
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        kubectl --kubeconfig=/etc/kubernetes/kubelet.conf get pods -A
+        --field-selector spec.nodeName={{ inventory_hostname }} --no-headers
+        | grep -E 'calico|kube-proxy' | grep -vc Running
+      args:
+        executable: /bin/bash
+      register: cni_br
+      changed_when: false
+      failed_when: cni_br.stdout | int > 0
+
+    # Segunda interfaz para el host KVM que corre en este nodo, colgada del
+    # bridge. Se hace en caliente (--update): no hace falta reiniciar la VM
+    # ni pasar el host a mantenimiento en OLVM.
+    - name: "Localizar el host KVM de este nodo"
+      ansible.builtin.set_fact:
+        vm_host: "{{ olvm.vms | selectattr('nodo', 'equalto', inventory_hostname) | first }}"
+
+    - name: "¿Tiene ya la VM una NIC en el bridge?"
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        virsh domiflist {{ vm_host.nombre }} | grep -c '{{ olvm.red.bridge_alumnos }}' || true
+      args:
+        executable: /bin/bash
+      register: nic_bridge
+      changed_when: false
+
+    - name: "Añadir la NIC del bridge a {{ vm_host.nombre }}"
+      ansible.builtin.command: >-
+        virt-xml {{ vm_host.nombre }}
+        --add-device
+        --network bridge={{ olvm.red.bridge_alumnos }},model=virtio
+        --update
+      when: nic_bridge.stdout | int == 0
+      changed_when: true
+
+    - name: "Verificación — la VM tiene su NIC en el bridge"
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        virsh domiflist {{ vm_host.nombre }} | grep -c '{{ olvm.red.bridge_alumnos }}'
+      args:
+        executable: /bin/bash
+      register: nic_final
+      changed_when: false
+      failed_when: nic_final.stdout | int != 1
+
+    - name: "Resumen"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: {{ olvm.red.bridge_alumnos }} sobre
+          {{ olvm.red.nic_alumnos[inventory_hostname] }}, y
+          {{ vm_host.nombre }} con NIC en el bridge
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 5 — IMÁGENES CLOUD Y CREACIÓN DE LAS VMs
+# ═══════════════════════════════════════════════════════════════════════════
+- name: "OLVM — provisionar las VMs del laboratorio"
+  hosts: worker2:worker3:worker4
+  gather_facts: false
+  become: true
+  # SIN tags a nivel de play: si se ponen aquí, todas las tareas heredan
+  # todas las etiquetas y --tags imagenes acaba creando las VMs. Van una
+  # a una, para que 'imagenes' sólo descargue y 'vms' sólo cree.
+
+  tasks:
+    - name: "Localizar la VM de este nodo y componer el /etc/hosts del entorno"
+      tags: [imagenes, vms, verificar]
+      ansible.builtin.set_fact:
+        vm: "{{ olvm.vms | selectattr('nodo', 'equalto', inventory_hostname) | first }}"
+        # OLVM exige resolución directa E INVERSA de todos los FQDN del entorno.
+        # Con /etc/hosts basta: getent resuelve en ambos sentidos.
+        olvm_etc_hosts: |-
+          {% for h in olvm.vms %}
+          {{ h.ip }} {{ h.fqdn }} {{ h.nombre }}
+          {% endfor %}
+
+    - name: "Descargar la imagen cloud de Oracle Linux (verificada por SHA256)"
+      ansible.builtin.get_url:
+        url: "{{ olvm.imagenes[vm.so].url }}"
+        dest: "{{ olvm.vm_dir }}/base-{{ vm.so }}.qcow2"
+        checksum: "sha256:{{ olvm.imagenes[vm.so].sha256 }}"
+        mode: "0644"
+        timeout: 120
+      tags: [imagenes]
+
+    - name: "¿Existe ya la VM?"
+      ansible.builtin.command: "virsh dominfo {{ vm.nombre }}"
+      register: dominfo
+      changed_when: false
+      failed_when: false
+      tags: [vms]
+
+    - name: "Crear el disco de la VM a partir de la imagen base"
+      ansible.builtin.copy:
+        src: "{{ olvm.vm_dir }}/base-{{ vm.so }}.qcow2"
+        dest: "{{ olvm.vm_dir }}/{{ vm.nombre }}.qcow2"
+        remote_src: true
+        mode: "0600"
+      when: dominfo.rc != 0
+      tags: [vms]
+
+    - name: "Redimensionar el disco a {{ vm.disco_gb }} GB (cloud-init hace el growpart)"
+      ansible.builtin.command: "qemu-img resize {{ olvm.vm_dir }}/{{ vm.nombre }}.qcow2 {{ vm.disco_gb }}G"
+      when: dominfo.rc != 0
+      changed_when: true
+      tags: [vms]
+
+    - name: "Generar user-data de cloud-init"
+      ansible.builtin.copy:
+        dest: "/tmp/{{ vm.nombre }}-user-data"
+        mode: "0600"
+        content: |
+          #cloud-config
+          hostname: {{ vm.nombre }}
+          fqdn: {{ vm.fqdn }}
+          prefer_fqdn_over_hostname: true
+          users:
+            - name: ivan
+              groups: [wheel]
+              sudo: "ALL=(ALL) NOPASSWD:ALL"
+              shell: /bin/bash
+              ssh_authorized_keys:
+                - {{ hostvars['maestro']['olvm_ssh_key'] }}
+          ssh_pwauth: false
+          packages: {{ olvm.imagenes[vm.so].paquetes | to_json }}
+          write_files:
+            - path: /etc/hosts
+              append: true
+              # indent(6): dentro del cloud-config renderizado este bloque
+              # queda a 6 espacios, no a los 16 que se ven en este fichero.
+              content: |
+                {{ olvm_etc_hosts | trim | indent(6) }}
+          runcmd:
+            - [ systemctl, enable, --now, chronyd ]
+      when: dominfo.rc != 0
+      tags: [vms]
+
+    - name: "Generar network-config de cloud-init (IP estática en la LAN)"
+      ansible.builtin.copy:
+        dest: "/tmp/{{ vm.nombre }}-network-config"
+        mode: "0600"
+        content: |
+          version: 2
+          ethernets:
+            # La clave DEBE ser el nombre real de la interfaz dentro de la
+            # VM (ver olvm.red.nic_vm en desa.yaml): el renderer sysconfig
+            # de cloud-init escribe ifcfg-<clave>, y un "match:" con un
+            # nombre inventado genera un fichero que no se aplica jamás.
+            {{ olvm.red.nic_vm }}:
+              dhcp4: false
+              addresses: [ "{{ vm.ip }}/{{ olvm.red.prefijo }}" ]
+              routes:
+                # "to: default" es sintaxis de netplan; el parser v2 de
+                # cloud-init 23.x la rechaza con "Address default is not a
+                # valid ip address". Hay que dar la red explícita.
+                - to: 0.0.0.0/0
+                  via: "{{ olvm.red.gateway }}"
+              nameservers:
+                addresses: [ "{{ olvm.red.dns }}" ]
+      when: dominfo.rc != 0
+      tags: [vms]
+
+    - name: "Construir el seed ISO de cloud-init"
+      ansible.builtin.command: >-
+        cloud-localds
+        --network-config=/tmp/{{ vm.nombre }}-network-config
+        {{ olvm.vm_dir }}/{{ vm.nombre }}-seed.iso
+        /tmp/{{ vm.nombre }}-user-data
+      when: dominfo.rc != 0
+      changed_when: true
+      tags: [vms]
+
+    # macvtap en modo bridge: la VM cuelga directamente de enp1s0f0 y coge IP
+    # de la LAN, sin crear ningún bridge ni tocar la IP del nodo.
+    #
+    # trustGuestRxFilters=yes es IMPRESCINDIBLE en los hosts KVM. Por defecto
+    # macvtap sólo acepta tramas ENTRANTES dirigidas a la MAC que le asignó
+    # libvirt. Las VMs de los alumnos cuelgan del bridge ovirtmgmt dentro del
+    # host y tienen MAC propia: sus peticiones DHCP salen bien y el router
+    # responde, pero la respuesta se descarta en el macvtap y la VM se queda
+    # sin IP. Con este atributo el invitado puede registrar MACs adicionales
+    # en el filtro del macvtap y el tráfico anidado entra.
+    - name: "Crear la VM con virt-install"
+      ansible.builtin.command: >-
+        virt-install
+        --name {{ vm.nombre }}
+        --memory {{ vm.memoria_mb }}
+        --vcpus {{ vm.vcpus }}
+        --cpu host-passthrough
+        --disk path={{ olvm.vm_dir }}/{{ vm.nombre }}.qcow2,format=qcow2,bus=virtio
+        --disk path={{ olvm.vm_dir }}/{{ vm.nombre }}-seed.iso,device=cdrom
+        --network type=direct,source={{ olvm.red.nic_nodo }},source_mode=bridge,model=virtio{{ ',trustGuestRxFilters=yes' if vm.rol == 'host' else '' }}
+        --osinfo detect=on,require=off
+        --graphics vnc,listen=127.0.0.1
+        --import
+        --noautoconsole
+      when: dominfo.rc != 0
+      changed_when: true
+      tags: [vms]
+
+    - name: "Marcar la VM para que arranque sola con el nodo"
+      ansible.builtin.command: "virsh autostart {{ vm.nombre }}"
+      changed_when: false
+      tags: [vms]
+
+    - name: "Esperar a que la VM responda por SSH (cloud-init tarda un par de minutos)"
+      ansible.builtin.wait_for:
+        host: "{{ vm.ip }}"
+        port: 22
+        timeout: 420
+        delay: 20
+      delegate_to: maestro
+      become: false
+      tags: [vms]
+
+    # add_host lleva BYPASS_HOST_LOOP=True: se ejecuta UNA sola vez, para el
+    # primer host del play, no una vez por nodo. Por eso recorre él mismo la
+    # lista completa de VMs en vez de añadir sólo la de este nodo.
+    - name: "Meter las VMs en el inventario en caliente para poder verificarlas"
+      ansible.builtin.add_host:
+        name: "{{ item.nombre }}"
+        groups: olvm_vms
+        ansible_host: "{{ item.ip }}"
+        ansible_user: ivan
+        ansible_python_interpreter: "{{ olvm.imagenes[item.so].python }}"
+        olvm_rol: "{{ item.rol }}"
+      loop: "{{ olvm.vms }}"
+      loop_control:
+        label: "{{ item.nombre }} ({{ item.ip }})"
+      run_once: true
+      changed_when: false
+      tags: [vms, verificar]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 6 — VERIFICACIÓN: NODOS ANFITRIONES
+# ═══════════════════════════════════════════════════════════════════════════
+- name: "OLVM — verificación de los nodos anfitriones"
+  hosts: worker2:worker3:worker4
+  gather_facts: false
+  become: true
+  tags: [verificar]
+
+  tasks:
+    - name: "Localizar la VM de este nodo"
+      ansible.builtin.set_fact:
+        vm: "{{ olvm.vms | selectattr('nodo', 'equalto', inventory_hostname) | first }}"
+
+    - name: "La VM está running"
+      ansible.builtin.command: "virsh domstate {{ vm.nombre }}"
+      register: domstate
+      changed_when: false
+      failed_when: "'running' not in domstate.stdout"
+
+    - name: "El nodo sigue Ready tras la reserva de kubelet"
+      ansible.builtin.command: >-
+        kubectl --kubeconfig=/etc/kubernetes/kubelet.conf get node {{ inventory_hostname }}
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: ready
+      changed_when: false
+      failed_when: ready.stdout != "True"
+
+    - name: "virbr0 sigue sin existir"
+      ansible.builtin.command: "ip -br link show virbr0"
+      register: virbr0_final
+      changed_when: false
+      failed_when: virbr0_final.rc == 0
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAY 7 — VERIFICACIÓN: DENTRO DE LAS VMs
+# ═══════════════════════════════════════════════════════════════════════════
+# Usa el inventario en caliente del play 5, así que va por el SSH normal de
+# Ansible (clave montada en el EE) en vez de invocar ssh a mano.
+- name: "OLVM — verificación dentro de las VMs"
+  hosts: olvm_vms
+  gather_facts: true
+  become: true
+  tags: [verificar]
+
+  tasks:
+    - name: "Oracle Linux con la versión correcta"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    # Ansible NO expone los flags de CPU como fact (sólo processor, cores,
+    # count, nproc, threads_per_core y vcpus), así que hay que leer
+    # /proc/cpuinfo a mano.
+    - name: "Leer los flags de CPU de la VM"
+      ansible.builtin.command: "grep -m1 ^flags /proc/cpuinfo"
+      register: cpuflags
+      changed_when: false
+      when: olvm_rol == 'host'
+
+    - name: "El host KVM ve la extensión de virtualización (imprescindible para vdsm)"
+      ansible.builtin.assert:
+        that: "'vmx' in cpuflags.stdout.split()"
+        fail_msg: >-
+          {{ inventory_hostname }} no ve vmx. Revisar que virt-install usó
+          --cpu host-passthrough y que kvm_intel nested=1 en el anfitrión.
+        success_msg: "{{ inventory_hostname }}: vmx presente, puede ser host KVM"
+      when: olvm_rol == 'host'
+
+    - name: "Resolución directa e inversa de los FQDN del entorno (lo exige engine-setup)"
+      ansible.builtin.command: "getent hosts {{ item }}"
+      loop: "{{ olvm.vms | map(attribute='fqdn') | list }}"
+      changed_when: false
+
+    # Por comando y no con el módulo dnf: en OL8 los bindings de dnf sólo
+    # existen para platform-python 3.6, y ansible-core 2.20 ya no admite 3.6
+    # como destino. Normalmente esto es un no-op porque cloud-init ya instaló
+    # nfs-utils al arrancar (olvm.imagenes[].paquetes).
+    - name: "Asegurar nfs-utils (showmount) en la VM"
+      ansible.builtin.command: "dnf install -y nfs-utils"
+      args:
+        creates: /usr/sbin/showmount
+
+    - name: "El storage domain NFS es visible desde la VM"
+      ansible.builtin.command: "showmount -e {{ olvm.nfs.servidor }}"
+      register: nfs_vm
+      changed_when: false
+      failed_when: olvm.nfs.ruta not in nfs_vm.stdout
+
+    - name: "Resumen"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} ({{ ansible_host }}) listo — rol {{ olvm_rol }}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DESTRUIR (--tags destruir)
+# ═══════════════════════════════════════════════════════════════════════════
+- name: "OLVM — destruir el laboratorio y devolver la RAM al clúster"
+  hosts: worker2:worker3:worker4
+  gather_facts: false
+  become: true
+  tags: [destruir]
+
+  tasks:
+    - name: "Localizar la VM de este nodo"
+      ansible.builtin.set_fact:
+        vm: "{{ olvm.vms | selectattr('nodo', 'equalto', inventory_hostname) | first }}"
+
+    - name: "Apagar y borrar la VM con sus discos"
+      ansible.builtin.command: "virsh destroy {{ vm.nombre }}"
+      failed_when: false
+      changed_when: true
+
+    - name: "Undefine"
+      ansible.builtin.command: "virsh undefine {{ vm.nombre }} --remove-all-storage"
+      failed_when: false
+      changed_when: true
+
+    - name: "Restaurar la configuración original de kubelet"
+      ansible.builtin.copy:
+        src: /var/lib/kubelet/config.yaml.pre-olvm
+        dest: /var/lib/kubelet/config.yaml
+        remote_src: true
+        mode: "0644"
+      register: restaurado
+
+    - name: "Reiniciar kubelet"
+      ansible.builtin.systemd_service:
+        name: kubelet
+        state: restarted
+      when: restaurado.changed
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PENDIENTE MANUAL — no automatizable desde aquí
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 1. ENGINE — dentro de olvm-engine (192.168.2.118)
+#    dnf install -y oracle-ovirt-release-45-el8
+#    dnf clean all && dnf repolist          # verificar ol8_x86_64_ovirt45
+#    dnf install -y ovirt-engine
+#    engine-setup                            # FQDN: olvm.ivanosuna.com
+#
+#    engine-setup admite fichero de respuestas para hacerlo desatendido:
+#    engine-setup --generate-answer=/root/olvm.answers  (tras la primera vez)
+#
+# 2. ALTA DE HOSTS — desde la UI del engine o vía API REST
+#    Compute → Hosts → New, para olvm-host1 (.120) y olvm-host2 (.119).
+#    Tipo de CPU del clúster: familia IvyBridge/SandyBridge (mínimo común
+#    denominador). Si se deja en automático detectará el del primer host y
+#    el otro no podrá unirse ni migrar.
+#
+# 3. STORAGE DOMAIN — Storage → Domains → New
+#    Tipo NFS, ruta 192.168.2.105:/datos/olvm
+#    Requiere estar en un Data Center activo con al menos un host Up.
+#    Live migration exige storage domain COMPARTIDO. Ya lo es (NFS).
+#
+# 4. USUARIOS — 10 alumnos + instructor sobre un OLVM compartido
+#    OLVM 4.5 trae Keycloak como IdP por defecto. Dos caminos:
+#      a) usuarios internos (ovirt-aaa-jdbc-tool user add alumnoNN ...)
+#      b) engancharlo al Keycloak que ya tienes en el clúster
+#    Dar a cada alumno rol UserVmManager sobre SU propio pool y una cuota
+#    (Quota) de RAM/CPU, para que nadie se coma la piscina.
+#
+# 5. DIMENSIONADO DE LAS VMs DE ALUMNO — esto es lo que hay que respetar
+#    host1 (10 GB) y host2 (9 GB), menos ~1,5 GB de OL9 + vdsm cada uno
+#    →  ~8,5 y ~7,5 GB útiles  →  ~16 GB en total para VMs de alumno.
+#
+#    Con 11 personas (10 alumnos + instructor) el reparto que cabe es:
+#      - 1 GB por VM de alumno  →  11 GB, quedan ~6 GB de margen para que
+#        cada uno cree una segunda VM durante los ejercicios.
+#      - NO uses OL9 minimal a 1,5 GB para las 11: son 16,5 GB de 16 y NO
+#        cabe. Ni con los 17 GB de antes habría quedado margen.
+#    Para las prácticas de ciclo de vida, red y snapshots el invitado da
+#    igual: CirrOS o Alpine (256-512 MB) van sobradas y arrancan rápido, que
+#    es justo lo que escasea aquí. Deja OL9 para una o dos VMs compartidas
+#    donde haga falta un Oracle Linux de verdad por dentro.
+#
+#    Reparte los alumnos entre los dos hosts (5 y 5), no todos en host1.
+#
+# 6. MIGRACIÓN — sólo demostración del instructor, los alumnos no la ejecutan
+#    Eso relaja mucho el dimensionado: no hace falta que toda la carga quepa
+#    en un solo host. Basta una VM pequeña dedicada (CirrOS 256 MB) que se
+#    mueva entre host1 y host2 para enseñar live migration y maintenance mode.
+#
+#    Aviso sobre HA/fencing: OLVM necesita un agente de power management real
+#    para el fencing, y estos hosts son VMs de libvirt, no hardware con IPMI.
+#    Si el temario pide HA, hay que probar antes si el mecanismo de fence
+#    agent personalizado del engine puede atacar a libvirt del anfitrión; si
+#    no sale, la parte de HA se queda en teoría.

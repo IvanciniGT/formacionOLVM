@@ -111,6 +111,84 @@ Estas capturas reflejan el estado observado el **25 de agosto de 2026**. Si la i
 
 ---
 
+# Día 3 · Ciclo de vida de una VM, templates, pools y permisos
+
+## Máquinas virtuales y operaciones
+
+1. **OLVM Virtual Machine Architecture**
+   Relación entre la definición de una VM, QEMU/KVM, dispositivos VirtIO, Guest Agent, templates, snapshots y VM Pools.
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/arch/architecture-ap-virtual-machines.html>
+
+2. **OLVM Administration: Virtual Machine Tasks**
+   Creación y administración de VMs, instalación del Guest Agent, snapshots, templates, importación y live migration.
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/admin/admin-vm-tasks.html>
+
+3. **OLVM Administration: Hot Plugging Virtual Devices**
+   Conexión y desconexión en caliente de discos, vNICs y otros dispositivos compatibles.
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/admin/admin-hot-plug-devices.html>
+
+4. **OLVM Host Architecture**
+   Papel de VDSM, libvirt y QEMU en la ejecución y supervisión de las VMs.
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/arch/architecture-arch-host-arch.html>
+
+5. **OLVM Administration: Host Tasks**
+   Mantenimiento de hosts y evacuación o migración de sus VMs.
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/admin/admin-host-tasks.html>
+
+## Usuarios y delegación
+
+6. **OLVM User Permissions Architecture**
+   Modelo de usuarios, grupos, roles, permisos y herencia sobre objetos.
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/arch/architecture-ap-user-permissions.html>
+
+7. **OLVM Administration Portal User Management**
+   Gestión administrativa de usuarios y permisos desde el portal.
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/admin/admin-admin-portal-user-management.html>
+
+8. **oVirt Virtual Machine Management Guide**
+   Referencia upstream para roles de VM, creación desde templates, pools, sealing, cloud-init y operaciones del ciclo de vida.
+   <https://www.ovirt.org/documentation/virtual_machine_management_guide/>
+
+9. **Introduction to the VM Portal**
+   Alcance del portal de autoservicio y operaciones disponibles para los usuarios finales.
+   <https://www.ovirt.org/documentation/doc-Introduction_to_the_VM_Portal/>
+
+10. **oVirt Administration Guide**
+    Referencia upstream para cuotas, modos de aplicación, QoS y administración avanzada.
+    <https://www.ovirt.org/documentation/administration_guide/>
+
+## Alta disponibilidad, agentes y drivers del invitado
+
+11. **OLVM Administration: Optimizing Clusters, Hosts and Virtual Machines**
+    Parámetros de recursos, memoria, CPU, pinning y optimización de máquinas virtuales.
+    <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/admin/admin-optimize-clus-host-vm.html>
+
+12. **Oracle Linux KVM: Add Watchdog Device to KVM Instance**
+    Funcionamiento del watchdog virtual, modelo `i6300esb` y acciones cuando expira el temporizador.
+    <https://docs.oracle.com/en/operating-systems/oracle-linux/8/kvm-user/kvm-config_vm_watchdog.html>
+
+13. **AlmaLinux 9 AppStream: paquete `watchdog`**
+    Contenido del paquete que proporciona el daemon y la unidad `watchdog.service` dentro del invitado.
+    <https://www.rpmfind.net/linux/RPM/almalinux/9.8/appstream/x86_64/watchdog-5.16-2.el9.x86_64.html>
+
+14. **AlmaLinux 9 BaseOS: paquete `kernel-modules-core`**
+    Relación de módulos del kernel, incluido `virtio_balloon`, utilizado para memory ballooning.
+    <https://www.rpmfind.net/linux/RPM/almalinux/9.7/baseos/x86_64/kernel-modules-core-5.14.0-611.34.1.el9_7.x86_64.html>
+
+## Fuentes de la instalación del curso
+
+El material del día 3 también se ha ajustado a la configuración observada en el laboratorio y a los playbooks que lo construyen:
+
+- dos hosts OLVM anidados, con capacidad limitada, por lo que las operaciones pesadas se hacen de forma escalonada;
+- almacenamiento NFS compartido mediante `curso-nfs` y `curso-nfs-2`;
+- red lógica y perfil vNIC `alumnos` para las VMs del curso;
+- VMs asignadas individualmente a los alumnos y varias imágenes ligeras de referencia;
+- permisos `UserVmManager` sobre la VM asignada y, en el estado actual del aula, privilegios administrativos globales adicionales.
+
+La última circunstancia obliga a tratar el VM Portal y la delegación como una práctica controlada: la visibilidad real de un alumno puede ser mayor de la que tendría en un diseño de producción con mínimo privilegio.
+
+---
+
 # Criterio de uso de las fuentes
 
 - Para comportamiento específico de OLVM, se prioriza Oracle.

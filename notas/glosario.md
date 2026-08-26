@@ -160,6 +160,118 @@ Modelo reutilizable a partir del cual se crean VMs con una configuración e imá
 
 ---
 
+# Máquinas virtuales, despliegue y acceso
+
+## Estado `Down`
+
+La VM está apagada y no existe un proceso QEMU ejecutándola en un host. Su definición, discos y demás metadatos siguen almacenados y administrados por OLVM.
+
+## QEMU Guest Agent
+
+Agente instalado dentro del sistema operativo invitado. Informa a OLVM de datos como direcciones IP y aplicaciones, y permite operaciones coordinadas como apagado ordenado o congelación del filesystem cuando la configuración lo admite. No es VDSM y no administra el host.
+
+## Canal de Guest Agent
+
+Dispositivo virtual de comunicación entre el invitado y el proceso de la VM. Permite que el Guest Agent hable con la plataforma sin depender de una sesión SSH hacia la VM.
+
+## VirtIO
+
+Familia de dispositivos paravirtualizados para disco, red, memoria y otros recursos. El invitado utiliza drivers VirtIO para obtener una comunicación eficiente con el hipervisor.
+
+## Hot plug
+
+Conexión de un dispositivo o ampliación de determinados recursos mientras la VM está encendida. Que OLVM permita la operación no garantiza que el sistema operativo invitado la detecte o utilice sin pasos adicionales.
+
+## Hot unplug
+
+Desconexión en caliente de un dispositivo. Debe prepararse primero dentro del invitado para evitar pérdida de datos o interrupciones inesperadas.
+
+## Memoria física garantizada
+
+Cantidad de memoria que OLVM reserva como compromiso mínimo para la VM. No es necesariamente igual a la memoria configurada ni a la memoria máxima que podría alcanzar mediante mecanismos compatibles.
+
+## Sellado o generalización
+
+Preparación de una VM para convertirla en molde, eliminando identidades que no deben duplicarse: claves de host, reglas persistentes, identificadores, logs o datos específicos. Comparación aproximada: **generalizar una plantilla en vSphere**.
+
+## Cloud-init
+
+Mecanismo de inicialización que personaliza una instancia durante el arranque: hostname, usuarios, claves SSH, red, paquetes o scripts. OLVM entrega los datos; el servicio `cloud-init` dentro del invitado debe estar instalado y operativo para aplicarlos.
+
+## ConfigDrive
+
+Medio virtual que presenta a la VM los metadatos y datos de personalización. Que el ConfigDrive exista demuestra la entrega del contenido, no que el invitado lo haya procesado correctamente.
+
+## Clone dependiente
+
+VM creada desde un template que conserva dependencia de sus imágenes base mediante copy-on-write. Ahorra espacio y tiempo inicial, pero mantiene una relación operativa con la cadena de imágenes del template.
+
+## Clone independiente
+
+Copia cuya imagen de disco deja de depender del template de origen. Requiere más tiempo y capacidad, pero simplifica su independencia posterior.
+
+## VM Pool
+
+Conjunto de VMs similares creado desde un template y ofrecido a usuarios como reserva compartida. La plataforma asigna una VM disponible cuando el usuario solicita una.
+
+## Stateless
+
+Modo en el que los cambios realizados durante una sesión no se consideran persistentes y pueden descartarse al terminar el ciclo de uso definido. Es útil para escritorios o laboratorios que deben volver a un estado conocido.
+
+## VM prearrancada
+
+VM de un pool que se mantiene encendida y disponible antes de que un usuario la solicite. Reduce el tiempo de espera a costa de consumir recursos de cómputo por anticipado.
+
+## VM Portal
+
+Portal de autoservicio orientado al usuario final. Muestra y permite operar únicamente sobre los objetos para los que ese usuario tiene permisos; no es una frontera de seguridad si al usuario también se le ha concedido un rol administrativo global.
+
+## Privilegio
+
+Capacidad elemental permitida por OLVM, por ejemplo ejecutar una VM o editar una propiedad. Los privilegios se agrupan en roles.
+
+## Rol
+
+Conjunto de privilegios con un propósito. Puede ser administrativo o de usuario. Un rol por sí solo no concede acceso hasta que se asigna a un usuario o grupo sobre un objeto.
+
+## Permiso
+
+Asignación formada por **usuario o grupo + rol + objeto**. Responde a tres preguntas: quién, qué puede hacer y sobre qué parte del inventario.
+
+## Herencia de permisos
+
+Propagación de una asignación desde un objeto superior hacia sus objetos descendientes. Un permiso sobre el sistema o un Data Center puede tener un alcance mucho mayor que el mismo rol aplicado a una única VM.
+
+## `UserVmManager`
+
+Rol de usuario que permite administrar una VM concreta dentro del alcance donde se asigna. Aplicarlo sobre una VM no debería conceder por sí mismo control sobre las VMs de otros usuarios.
+
+## `SuperUser`
+
+Rol administrativo de alcance completo cuando se asigna sobre el sistema. Debe reservarse para administradores; prevalece en la práctica sobre un diseño de delegación más limitado.
+
+## Cuota
+
+Límite de consumo de recursos, normalmente CPU, memoria o almacenamiento, aplicado dentro de un Data Center. Una cuota no sustituye a los permisos: un usuario puede tener autorización y no tener capacidad disponible, o al revés.
+
+## Modo de cuota `Audit`
+
+Modo que calcula y registra el consumo o los incumplimientos sin impedir la operación. Sirve para observar el impacto antes de aplicar límites estrictos.
+
+## Modo de cuota `Enforced`
+
+Modo en el que una operación puede rechazarse si supera la cuota o si no dispone de una asignación válida.
+
+## `Preview`, `Commit` y `Undo`
+
+Fases de comprobación al restaurar un snapshot. `Preview` permite probar temporalmente el estado elegido; `Commit` lo acepta como nuevo estado y `Undo` abandona la prueba y vuelve al estado anterior.
+
+## OVA
+
+**Open Virtual Appliance.** Paquete portable utilizado para importar o exportar una VM o appliance con sus discos y metadatos. No conserva necesariamente todas las características específicas de la plataforma de origen.
+
+---
+
 # Networking
 
 ## NIC
