@@ -189,6 +189,88 @@ La última circunstancia obliga a tratar el VM Portal y la delegación como una 
 
 ---
 
+# Día 4 · Afinidad, alta disponibilidad, optimización y diagnóstico
+
+## Scheduler y afinidad
+
+1. **OLVM Architecture: High Availability and Optimization**
+   Políticas predeterminadas de scheduling, balanceo, migración y relación con la disponibilidad del Cluster.
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/arch/architecture-ap-ha-optimize.html>
+
+2. **OLVM Administration: Creating a Scheduling Policy**
+   Composición de una política mediante filtros, pesos, balanceador y propiedades.
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/admin/admin-admin-schedule-policy-create.html>
+
+3. **oVirt Virtual Machine Management Guide: Affinity Groups and Affinity Labels**
+   Referencia upstream detallada para reglas VM–VM y VM–Host, polaridad positiva/negativa, `Enforcing`, etiquetas, ejemplos y resolución de conflictos.
+   <https://www.ovirt.org/documentation/virtual_machine_management_guide/>
+
+## Alta disponibilidad y optimización
+
+4. **OLVM Administration: Optimizing Clusters, Hosts and Virtual Machines**
+   Referencia principal para fencing y hosts proxy, alta disponibilidad de VMs, VM leases, prioridad de migración/reinicio, overcommit, CPU shares, pinning, NUMA, ballooning, KSM, huge pages, I/O threads, multiqueue y perfiles de alto rendimiento.
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/admin/admin-optimize-clus-host-vm.html>
+
+5. **OLVM Administration: Host Tasks**
+   Estados y operaciones de los hosts, mantenimiento, gestión de energía y tareas administrativas relacionadas con la disponibilidad.
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/admin/admin-host-tasks.html>
+
+6. **OLVM Architecture: Hosts**
+   Arquitectura del host y relación entre Engine, VDSM, libvirt y QEMU/KVM.
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/arch/architecture-ap-hosts.html>
+
+7. **Oracle Linux KVM: Add Watchdog Device to KVM Instance**
+   Dispositivo watchdog virtual, daemon dentro del invitado y acciones ejecutadas al vencer el temporizador.
+   <https://docs.oracle.com/en/operating-systems/oracle-linux/8/kvm-user/kvm-config_vm_watchdog.html>
+
+## Eventos, logs y troubleshooting
+
+8. **OLVM Architecture: Event Logs**
+   Ubicación y finalidad de los principales logs de Engine y VDSM.
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/arch/architecture-ap-event-logs.html>
+
+9. **OLVM Release Notes: Obtaining the Log Files**
+   Instalación y uso de `ovirt-log-collector`, alcance de la recogida y ubicación del archivo resultante.
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/relnotes/relnotes-obtainingTheLogFiles.html>
+
+10. **oVirt Developer Guide: VDSM Log Files**
+   Referencia upstream para `vdsm.log`, logs de libvirt y diagnóstico de las operaciones ejecutadas en los hosts.
+   <https://www.ovirt.org/develop/developer-guide/vdsm/log-files.html>
+
+11. **oVirt Developer Guide: libvirt**
+   Relación de VDSM con libvirt y log de las llamadas realizadas por VDSM.
+   <https://www.ovirt.org/develop/projects/libvirt.html>
+
+12. **OLVM Administration: Storage Tasks**
+   Estados y operaciones de Storage Domains utilizados para interpretar incidencias de NFS, discos e imágenes.
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/admin/admin-storage-tasks.html>
+
+## Fuentes de la instalación del curso
+
+El contenido del día 4 se ha contrastado con la automatización y el estado observado del laboratorio:
+
+- Engine se ejecuta como VM en `worker2`; los hosts OLVM anidados se ejecutan en `worker3` y `worker4`;
+- los datos de las VMs se encuentran en los Storage Domains NFS `curso-nfs` y `curso-nfs-2`;
+- los hosts anidados no tienen configurado un BMC físico, por lo que la gestión de energía y el fencing real no están disponibles.
+
+Estas características se utilizan para diferenciar lo que el aula permite observar de lo que exigiría una arquitectura física empresarial con gestión fuera de banda, redundancia y capacidad N+1 probadas.
+
+# Anexo opcional · Monitorización, histórico y notificaciones
+
+13. **OLVM Administration: Monitoring and Observability**
+    Monitorización desde el portal, eventos, notificaciones por correo y SNMP, Grafana y Performance Co-Pilot.
+    <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/admin/admin-monitoring.html>
+
+14. **OLVM Architecture: Grafana and Data Warehouse**
+    Base histórica `ovirt_engine_history`, recogida periódica, agregaciones y modos de retención de DWH.
+    <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/arch/architecture-ap-grafana.html>
+
+## Fuentes de la instalación del anexo
+
+El anexo de monitorización se apoya además en la configuración observada de DWH, `collectd`, Prometheus, Grafana externo, `ovirt-engine-notifier` y Mailpit, pero no forma parte del reparto principal de cinco horas del día 4.
+
+---
+
 # Criterio de uso de las fuentes
 
 - Para comportamiento específico de OLVM, se prioriza Oracle.
