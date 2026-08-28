@@ -149,6 +149,8 @@ D. Reservar una CPU física completa para Engine.
 
 ## 20. ¿Qué precaución requiere contar los threads SMT como cores?
 
+SMT: Simultaneous Multi Threading. Tecnología que permite a un núcleo físico ejecutar varios hilos de ejecución (threads) al mismo tiempo, compartiendo recursos internos del core. INTEL Lo llama HyperThreading.
+
 A. Un thread SMT no aporta necesariamente el mismo rendimiento que un núcleo físico completo.  
 B. Impide utilizar KVM.  
 C. Convierte automáticamente todas las VMs en no migrables.  
@@ -177,7 +179,7 @@ D. La memoria reservada para el rol SPM.
 
 ## 24. ¿Qué necesita memory ballooning para funcionar de forma útil?
 
-A. Soporte habilitado en la plataforma y un dispositivo/driver compatible en el guest, además de margen entre memoria definida y garantizada.  
+A. Soporte habilitado en la plataforma y un dispositivo/driver compatible en el guest, además de margen entre memoria definida y garantizada.   virtio-balloon es un driver que permite a la VM ajustar dinámicamente la cantidad de memoria que utiliza, lo que es útil para el overcommit de RAM.
 B. Únicamente `qemu-guest-agent` en Engine.  
 C. Un disco RAW en vez de QCOW2.  
 D. Un host que sea SPM.

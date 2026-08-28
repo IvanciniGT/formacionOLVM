@@ -255,19 +255,128 @@ El contenido del día 4 se ha contrastado con la automatización y el estado obs
 
 Estas características se utilizan para diferenciar lo que el aula permite observar de lo que exigiría una arquitectura física empresarial con gestión fuera de banda, redundancia y capacidad N+1 probadas.
 
-# Anexo opcional · Monitorización, histórico y notificaciones
+# Día 5 · Monitorización e instalación
 
-13. **OLVM Administration: Monitoring and Observability**
-    Monitorización desde el portal, eventos, notificaciones por correo y SNMP, Grafana y Performance Co-Pilot.
-    <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/admin/admin-monitoring.html>
+## Monitorización, histórico y diagnóstico
 
-14. **OLVM Architecture: Grafana and Data Warehouse**
-    Base histórica `ovirt_engine_history`, recogida periódica, agregaciones y modos de retención de DWH.
-    <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/arch/architecture-ap-grafana.html>
+1. **OLVM Administration: Monitoring and Diagnostics**  
+   Referencia principal para Monitoring Portal, Grafana, Event Notifier, correo, SNMP, Performance Co-Pilot y diagnóstico de la plataforma.  
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/admin/admin-monitoring.html>
 
-## Fuentes de la instalación del anexo
+2. **OLVM Architecture: System State and History**  
+   Diferencia entre la base operativa `engine`, la base histórica `ovirt_engine_history` y el proceso ETL de Data Warehouse.  
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/arch/architecture-ap-sys-state-hist.html>
 
-El anexo de monitorización se apoya además en la configuración observada de DWH, `collectd`, Prometheus, Grafana externo, `ovirt-engine-notifier` y Mailpit, pero no forma parte del reparto principal de cinco horas del día 4.
+3. **OLVM Architecture: Data Warehouse and Databases**  
+   Arquitectura de las bases PostgreSQL, cambios de entidades y estadísticas conservadas por DWH.  
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/arch/architecture-arch-dwh-db.html>
+
+4. **OLVM Architecture: Data Visualization with Grafana**  
+   Origen de datos de la integración nativa, periodicidad de recogida, agregaciones y escalas de retención.  
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/arch/architecture-ap-grafana.html>
+
+5. **OLVM Administration: Databases**  
+   Identificación de las bases, consulta oficial de tamaños y procedimiento soportado de mantenimiento. En clase solo se utilizan consultas de lectura.  
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/admin/admin-data-bases-tasks.html>
+
+6. **OLVM Architecture: Event Logging and Notifications**  
+   Función de `engine.log`, `vdsm.log`, eventos del portal, correo, SNMP y relación con `ovirt-log-collector`.  
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/arch/architecture-ap-event-logs.html>
+
+7. **OLVM Release Notes: Obtaining the Log Files**  
+   Instalación y ejecución de `ovirt-log-collector`, alcance por defecto, exclusión de PostgreSQL y ubicación del archivo resultante.  
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/relnotes/relnotes-obtainingTheLogFiles.html>
+
+8. **PostgreSQL: The Statistics Collector**  
+   Referencia primaria para `pg_stat_activity`, `pg_locks` y las vistas de estadísticas utilizadas en las consultas de diagnóstico.  
+   <https://www.postgresql.org/docs/current/monitoring-stats.html>
+
+9. **PostgreSQL: Error Reporting and Logging**  
+   Referencia primaria para `log_statement`, `log_min_duration_statement`, conexiones, duración, destinos y rotación de logs.  
+   <https://www.postgresql.org/docs/current/runtime-config-logging.html>
+
+## Arquitectura y requisitos de instalación
+
+10. **OLVM Architecture: Engine Host Requirements**  
+   Requisitos de sistema, capacidad y red del host de Engine, además de la separación entre Standalone Engine y host KVM.  
+   <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/arch/architecture-manager-reqs.html>
+
+11. **OLVM Architecture: KVM Host Requirements**  
+    Requisitos de sistema operativo, kernel, CPU, virtualización por hardware, memoria, disco y red de los hosts.  
+    <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/arch/architecture-kvm-reqs.html>
+
+12. **OLVM Architecture: Firewall Requirements**  
+    Matrices oficiales para Engine, hosts y componentes remotos, con origen, destino, protocolo, puerto y finalidad.  
+    <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/arch/architecture-firewall-reqs.html>
+
+13. **OLVM Architecture: Installation Scalability Limits**  
+    Límites y categorías de tamaño que deben revisarse al dimensionar Engine, Clusters, hosts y VMs.  
+    <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/arch/architecture-olv-install-scalability.html>
+
+## Instalación y configuración de Engine
+
+14. **OLVM Getting Started: Installation and Configuration**  
+    Orden general de despliegue: Engine, hosts KVM, redes, almacenamiento y máquinas virtuales.  
+    <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/getstart/getstarted-manager-install.html>
+
+15. **OLVM Getting Started: Install the Engine**  
+    Preparación del sistema, repositorios, paquete `ovirt-engine`, ejecución de `engine-setup` y opciones de bases, DWH, Grafana, Keycloak, proxies, OVN, FQDN y firewall.  
+    <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/getstart/getstarted-manager-install-prepare.html>
+
+16. **OLVM Administration: Keycloak Integration and Management**  
+    SSO, federación de usuarios y grupos, Active Directory, MFA y acceso al Monitoring Portal.  
+    <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/admin/admin-keycloak.html>
+
+## Self-Hosted Engine y hosts KVM
+
+17. **OLVM Getting Started: Self-Hosted Engine Deployment**  
+    Arquitectura, alta disponibilidad, requisitos generales y mínimo de dos hosts para la VM de Engine.  
+    <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/getstart/getstarted-hosted-engine-deploy.html>
+
+18. **OLVM Getting Started: Self-Hosted Engine Prerequisites**  
+    Requisitos de FQDN, release común, espacio, storage dedicado y rango de dos a siete hosts KVM para el despliegue.  
+    <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/getstart/getstarted-he-deploy-prereqs.html>
+
+19. **OLVM Getting Started: Deploy the Self-Hosted Engine**  
+    Preparación, prechecks, appliance de Engine, bootstrap, storage compartido y despliegue de los hosts Hosted Engine.  
+    <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/getstart/getstarted-he-deploy-tasks.html>
+
+20. **OLVM Getting Started: Configure a KVM Host**  
+    Preparación de Oracle Linux, repositorios, `olvm-pre-check.py`, alta desde el portal, autenticación SSH, instalación de VDSM y paso de `Installing` a `Up`.  
+    <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/getstart/getstarted-manager-install-kvm.html>
+
+21. **OLVM Administration: Backup and Restore**  
+    Backup inicial y periódico de configuración, base `engine` y DWH mediante `engine-backup`. Se utiliza como comprobación de aceptación, no como desarrollo completo del bloque de recuperación.  
+    <https://docs.oracle.com/en/virtualization/oracle-linux-virtualization-manager/admin/getstarted-backup-restore.html>
+
+## Fuentes de la instalación del curso
+
+El contenido de monitorización se ha ajustado a la instalación observada el **28 de agosto de 2026**:
+
+- `olvm-engine` se ejecuta como VM externa al Cluster OLVM, alojada en `worker2`;
+- DWH está instalado y mantiene la base histórica;
+- la integración nativa de Grafana no está instalada;
+- `collectd` expone métricas que consulta Prometheus y visualiza un Grafana externo;
+- `ovirt-engine-notifier` entrega notificaciones de laboratorio mediante SMTP a Mailpit;
+- los hosts OLVM son VMs anidadas y utilizan Storage Domains NFS.
+
+Estas características sirven para comparar una instalación real del aula con una arquitectura empresarial. Los números de versión, nombres de repositorios, kernels soportados, puertos opcionales y funciones en Technology Preview deben verificarse siempre en la documentación de la versión que se vaya a desplegar.
+
+---
+
+# Examen 1Z0-1170
+
+1. **Oracle Linux Virtualization Manager 4.5 Associate Certification**  
+   Ficha oficial del examen y referencia que debe comprobarse antes de reservarlo.  
+   <https://education.oracle.com/oracle-linux-virtualization-manager-associate/pexam_1Z0-1170>
+
+2. **Oracle Virtualization Blog: New Training to Learn About Oracle Virtualization**  
+   Anuncio oficial que publica 50 preguntas y un 68 % de aciertos como nota de corte.  
+   <https://blogs.oracle.com/virtualization/new-training-to-learn-about-oracle-virtualization>
+
+3. **Oracle Certification: Score Review FAQ**  
+   Criterios generales de puntuación y ausencia de penalización por respuestas incorrectas.  
+   <https://docs.oracle.com/en/education/customer-success/digital-learning-kit/ml-cert-faq/topics/ScoreReview.html>
 
 ---
 

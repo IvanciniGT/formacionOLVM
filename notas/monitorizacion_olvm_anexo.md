@@ -1,6 +1,6 @@
-# Anexo opcional · Monitorización de OLVM y del laboratorio
+# Anexo rápido · Monitorización de OLVM y del laboratorio
 
-Este contenido se ha retirado del itinerario principal del día 4 para dedicar ese tiempo al scheduler y a la afinidad. Queda disponible como material complementario o para una sesión posterior.
+Este fue el resumen preparado inicialmente como anexo del día 4. El desarrollo formal, las prácticas y la explicación de instalación se encuentran ahora en `dia5_conceptos.md` y `dia5_notas_clase.md`. Se conserva este fichero únicamente como hoja rápida de consulta.
 
 ---
 
@@ -157,11 +157,3 @@ Una alerta útil debe incluir:
 7. Revisar el estado de DWH sin modificarlo.
 8. Revisar el estado de `ovirt-engine-notifier`.
 9. Localizar en Mailpit una notificación de prueba ya existente, si la hubiera.
-
-# Preguntas de repaso del anexo
-
-1. ¿Qué diferencia existe entre evento, log y métrica?
-2. ¿Qué función cumple DWH?
-3. ¿Por qué el Grafana del aula no es el Grafana nativo de OLVM?
-4. ¿Cuál es el recorrido desde collectd hasta el panel?
-5. ¿Qué componentes revisarías si el evento existe pero no llega el correo?
